@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#  Uninstaller for DNS-AI Management Console
+#  Uninstaller for DNS-AI & GeoHide Management Console
 # ==============================================================================
 
 set -e

@@ -14,7 +14,7 @@ C_RED="\e[1;31m"
 C_RESET="\e[0m"
 
 echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-echo -e "${C_CYAN}║            Установка DNS-AI Management Console (TUI)               ║${C_RESET}"
+echo -e "${C_CYAN}║       Установка DNS-AI & GeoHide Management Console (TUI)          ║${C_RESET}"
 echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
 
 # Root check
@@ -138,13 +138,14 @@ setup_shell_aliases() {
     if ! grep -q "alias dns-ai=" "$rc" 2>/dev/null; then
         cat << 'ALIASES' >> "$rc"
 
-# DNS-AI Aliases
+# DNS-AI & GeoHide Aliases
 alias dns-ai='/usr/local/bin/dns-ai'
 alias dns-ai-tui='/usr/local/bin/dns-ai'
 alias dns-ai-on='sudo /usr/local/bin/dns-ai on'
 alias dns-ai-off='sudo /usr/local/bin/dns-ai off'
 alias dns-ai-status='/usr/local/bin/dns-ai status'
 alias dns-ai-test='/usr/local/bin/dns-ai test'
+alias dns-ai-check='/usr/local/bin/dns-ai check-ip'
 alias dns-ai-update='sudo /usr/local/bin/dns-ai update'
 ALIASES
     fi
@@ -159,9 +160,11 @@ echo ""
 echo -e "${C_GREEN}✓ Установка успешно завершена!${C_RESET}"
 echo -e "----------------------------------------------------------------------"
 echo -e "  Запуск TUI консоли:     ${C_CYAN}dns-ai${C_RESET}"
-echo -e "  Быстрое включение:      ${C_GREEN}dns-ai-on${C_RESET}  (или: ${C_CYAN}dns-ai on${C_RESET})"
+echo -e "  Быстрое включение:      ${C_GREEN}dns-ai-on${C_RESET}  (или: ${C_CYAN}dns-ai on [профиль]${C_RESET})"
 echo -e "  Быстрое выключение:     ${C_YELLOW}dns-ai-off${C_RESET} (или: ${C_CYAN}dns-ai off${C_RESET})"
+echo -e "  Выбор профиля:          ${C_CYAN}dns-ai profile {geohide-eu|geohide-us|geohide-ru|dns-ai}${C_RESET}"
 echo -e "  Диагностика сети и AI:  ${C_CYAN}dns-ai test${C_RESET}"
+echo -e "  Проверка IP онлайн:     ${C_CYAN}dns-ai check-ip${C_RESET}"
 echo -e "  Автозагрузка:           ${C_CYAN}dns-ai autostart enable${C_RESET}"
 echo -e "----------------------------------------------------------------------"
 echo ""

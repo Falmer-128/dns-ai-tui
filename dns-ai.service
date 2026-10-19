@@ -1,5 +1,5 @@
 [Unit]
-Description=DNS-AI Encrypted DNS and AI Services Routing
+Description=DNS-AI & GeoHide Encrypted DNS and AI Services Routing
 Documentation=https://github.com/Falmer-128/dns-ai-tui
 After=network-online.target systemd-resolved.service
 Wants=network-online.target systemd-resolved.service

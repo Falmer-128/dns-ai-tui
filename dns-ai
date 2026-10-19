@@ -1,17 +1,17 @@
 #!/bin/bash
 # ==============================================================================
-#  DNS-AI Management Console & TUI
-#  Encrypted DNS-over-TLS & AI Services Reverse-Proxy Manager
+#  DNS-AI & GeoHide Management Console & TUI
+#  Encrypted DNS-over-TLS & Multi-Provider AI Services Reverse-Proxy Manager
 #  Author: Falmer-128 (https://github.com/Falmer-128/dns-ai-tui)
 # ==============================================================================
 
 set -o pipefail
 
 # ----------------- Privilege Escalation -----------------
-# Commands like 'test' and 'status' can run without root.
-# Interactive TUI and modifying commands require root privileges.
+# Read-only commands can run without root.
+# Modifying commands and interactive TUI auto-elevate with sudo / doas.
 case "$1" in
-    test|status|-h|--help|help)
+    test|status|check-ip|-h|--help|help)
         ;;
     *)
         if [ "$(id -u)" -ne 0 ]; then
@@ -27,21 +27,24 @@ case "$1" in
         ;;
 esac
 
-# ----------------- Configuration & Constants -----------------
+# ----------------- Configuration & State Paths -----------------
 CONFIG_DIR="/etc/systemd/resolved.conf.d"
 CONFIG_FILE="$CONFIG_DIR/dns-ai.conf"
 HOSTS_FILE="/etc/hosts"
-CACHE_DIR="/etc/dns-ai"
-CACHE_FILE="$CACHE_DIR/endpoints.json"
-MODE_FILE="$CACHE_DIR/sni_mode"
+STATE_DIR="/etc/dns-ai"
+
+if [ "$(id -u)" -eq 0 ] || [ -w "$STATE_DIR" ]; then
+    CACHE_DIR="$STATE_DIR"
+else
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dns-ai"
+fi
+
+PROFILE_FILE="$STATE_DIR/profile"
+SNI_MODE_FILE="$STATE_DIR/sni_mode"
+METADATA_FILE="$CACHE_DIR/metadata.json"
+DNS_AI_CACHE="$CACHE_DIR/endpoints_dns_ai.json"
+GEOHIDE_CACHE="$CACHE_DIR/endpoints_geohide.json"
 SERVICE_NAME="dns-ai.service"
-
-TLS_NAME="dns.dns-ai.ru"
-FALLBACK_V4="194.87.196.13 45.151.102.219"
-FALLBACK_V6="2a00:b700:5::3:62 2a12:5940:d4ef::219"
-
-PRIMARY_SNI_IP="109.120.131.200"
-BACKUP_SNI_IP="143.20.64.55"
 
 # Terminal Colors
 C_RESET="\e[0m"
@@ -55,45 +58,136 @@ C_MAGENTA="\e[1;35m"
 C_GRAY="\e[0;90m"
 C_WHITE="\e[1;37m"
 
-mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+if [ "$(id -u)" -eq 0 ]; then
+    mkdir -p "$STATE_DIR" "$CONFIG_DIR" 2>/dev/null || true
+fi
 
-# ----------------- Core Network Functions -----------------
-fetch_endpoints() {
+# ----------------- Provider & Profile Definitions -----------------
+# Available Profiles:
+#   1. geohide-eu  - GeoHide Europe (Fast, Google AI, ChatGPT, Claude routed via EU IP)
+#   2. geohide-us  - GeoHide USA (All AI routed via US IP)
+#   3. geohide-ru  - GeoHide Russia (Bypasses foreign blocking of Russian sites)
+#   4. dns-ai      - DNS-AI (DoT dns.dns-ai.ru, Swedish SNI for ChatGPT/Claude)
+
+# Default Fallback Server Endpoints
+DNS_AI_TLS_NAME="dns.dns-ai.ru"
+DNS_AI_DEFAULT_V4="194.87.196.13 45.151.102.219"
+DNS_AI_DEFAULT_V6="2a00:b700:5::3:62 2a12:5940:d4ef::219"
+DNS_AI_SNI_OPENAI="62.60.230.61"
+DNS_AI_SNI_PRIMARY="109.120.131.200"
+
+GEOHIDE_EU_TLS_NAME="eu.geohide.ru"
+GEOHIDE_EU_DEFAULT_V4="143.20.64.192 45.13.237.213 31.25.239.132"
+GEOHIDE_EU_SNI_NODES="143.20.64.192 45.13.237.213 5.175.161.40 31.25.239.132"
+
+GEOHIDE_US_TLS_NAME="us.geohide.ru"
+GEOHIDE_US_DEFAULT_V4="192.255.159.240 192.255.159.241"
+GEOHIDE_US_SNI_NODES="192.255.159.240 192.3.233.253 107.175.76.134"
+
+GEOHIDE_RU_TLS_NAME="geohide.ru"
+GEOHIDE_RU_DEFAULT_V4="193.233.112.67 193.233.112.68"
+GEOHIDE_RU_SNI_NODES="193.233.112.67 193.233.112.68 159.194.200.33"
+
+# ----------------- Profile Helpers -----------------
+get_active_profile() {
+    local prof="geohide-eu"
+    if [ -f "$PROFILE_FILE" ]; then
+        prof=$(cat "$PROFILE_FILE" 2>/dev/null | tr -d ' \n')
+    elif [ -f "$CACHE_DIR/profile" ]; then
+        prof=$(cat "$CACHE_DIR/profile" 2>/dev/null | tr -d ' \n')
+    fi
+    case "$prof" in
+        geohide-eu|geohide-us|geohide-ru|dns-ai)
+            echo "$prof"
+            ;;
+        *)
+            echo "geohide-eu"
+            ;;
+    esac
+}
+
+get_profile_name() {
+    local prof="${1:-$(get_active_profile)}"
+    case "$prof" in
+        geohide-eu) echo "GeoHide EU (Европа — Рекомендуется)" ;;
+        geohide-us) echo "GeoHide US (США)" ;;
+        geohide-ru) echo "GeoHide RU (Россия)" ;;
+        dns-ai)     echo "DNS-AI (Россия DoT + Швеция SNI)" ;;
+        *)          echo "$prof" ;;
+    esac
+}
+
+get_profile_tls_name() {
+    local prof="${1:-$(get_active_profile)}"
+    case "$prof" in
+        geohide-eu) echo "$GEOHIDE_EU_TLS_NAME" ;;
+        geohide-us) echo "$GEOHIDE_US_TLS_NAME" ;;
+        geohide-ru) echo "$GEOHIDE_RU_TLS_NAME" ;;
+        dns-ai)     echo "$DNS_AI_TLS_NAME" ;;
+    esac
+}
+
+set_active_profile() {
+    local prof="$1"
+    mkdir -p "$STATE_DIR" "$CACHE_DIR" 2>/dev/null || true
+    echo "$prof" > "$PROFILE_FILE" 2>/dev/null || echo "$prof" > "$CACHE_DIR/profile" 2>/dev/null || true
+}
+
+set_sni_mode() {
+    local mode="$1"
+    mkdir -p "$STATE_DIR" "$CACHE_DIR" 2>/dev/null || true
+    echo "$mode" > "$SNI_MODE_FILE" 2>/dev/null || echo "$mode" > "$CACHE_DIR/sni_mode" 2>/dev/null || true
+}
+
+# ----------------- Network & Upstream Endpoints -----------------
+fetch_dns_ai_endpoints() {
     local data=""
-    data=$(curl -fsSL --max-time 5 https://dns-ai.ru/endpoints.json 2>/dev/null || \
-           curl -fsSL --max-time 5 https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json 2>/dev/null || true)
+    data=$(curl -fsSL --max-time 4 https://dns-ai.ru/endpoints.json 2>/dev/null || \
+           curl -fsSL --max-time 4 https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json 2>/dev/null || true)
     if [ -n "$data" ] && echo "$data" | grep -q '"v4"'; then
         mkdir -p "$CACHE_DIR" 2>/dev/null || true
-        echo "$data" > "$CACHE_FILE" 2>/dev/null || true
+        echo "$data" > "$DNS_AI_CACHE" 2>/dev/null || true
         echo "$data"
         return 0
-    elif [ -f "$CACHE_FILE" ]; then
-        cat "$CACHE_FILE"
+    elif [ -f "$DNS_AI_CACHE" ]; then
+        cat "$DNS_AI_CACHE"
         return 0
     fi
     return 1
 }
 
-get_current_ips() {
-    local v4="" v6=""
-    local json=""
-    json=$(fetch_endpoints 2>/dev/null || true)
-    if [ -n "$json" ]; then
-        v4=$(echo "$json" | sed -n 's/.*"v4":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 2 | tr '\n' ' ')
-        v6=$(echo "$json" | sed -n 's/.*"v6":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep ':' | head -n 2 | tr '\n' ' ')
-    fi
-
-    if [ -z "$v4" ]; then
-        v4="$FALLBACK_V4"
-        v6="$FALLBACK_V6"
-    fi
-    echo "$v4|$v6"
+get_profile_dns_servers() {
+    local prof="${1:-$(get_active_profile)}"
+    case "$prof" in
+        dns-ai)
+            local json="" v4="" v6=""
+            json=$(fetch_dns_ai_endpoints 2>/dev/null || true)
+            if [ -n "$json" ]; then
+                v4=$(echo "$json" | sed -n 's/.*"v4":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 3 | tr '\n' ' ')
+                v6=$(echo "$json" | sed -n 's/.*"v6":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep ':' | head -n 2 | tr '\n' ' ')
+            fi
+            [ -z "$v4" ] && v4="$DNS_AI_DEFAULT_V4"
+            [ -z "$v6" ] && v6="$DNS_AI_DEFAULT_V6"
+            echo "$v4|$v6"
+            ;;
+        geohide-eu)
+            echo "$GEOHIDE_EU_DEFAULT_V4|"
+            ;;
+        geohide-us)
+            echo "$GEOHIDE_US_DEFAULT_V4|"
+            ;;
+        geohide-ru)
+            echo "$GEOHIDE_RU_DEFAULT_V4|"
+            ;;
+    esac
 }
 
+# ----------------- TLS & SNI Validation -----------------
 verify_sni_tls() {
     local host="$1"
     local ip="$2"
-    local timeout="${3:-2.5}"
+    local timeout="${3:-2.0}"
     python3 -c "
 import ssl, socket, sys
 try:
@@ -111,17 +205,43 @@ except Exception:
 " 2>/dev/null
 }
 
-determine_sni_ip() {
+find_best_sni_node() {
+    local host="$1"
+    shift
+    local candidates=("$@")
+    for ip in "${candidates[@]}"; do
+        if verify_sni_tls "$host" "$ip" 1.8; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+determine_google_sni_ip() {
     local mode="auto"
-    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+    if [ -f "$SNI_MODE_FILE" ]; then
+        mode=$(cat "$SNI_MODE_FILE" 2>/dev/null | tr -d ' \n')
+    elif [ -f "$CACHE_DIR/sni_mode" ]; then
+        mode=$(cat "$CACHE_DIR/sni_mode" 2>/dev/null | tr -d ' \n')
+    fi
 
     case "$mode" in
-        backup|143*)
-            echo "$BACKUP_SNI_IP"
+        geohide-eu|eu*)
+            find_best_sni_node "generativelanguage.googleapis.com" $GEOHIDE_EU_SNI_NODES || echo "143.20.64.192"
+            return 0
+            ;;
+        geohide-us|us*)
+            find_best_sni_node "generativelanguage.googleapis.com" $GEOHIDE_US_SNI_NODES || echo "192.255.159.240"
             return 0
             ;;
         primary|109*)
-            echo "$PRIMARY_SNI_IP"
+            echo "$DNS_AI_SNI_PRIMARY"
+            return 0
+            ;;
+        direct|bypass)
+            # Use Google Anycast IP directly
+            echo "172.217.117.4"
             return 0
             ;;
         none|disabled)
@@ -133,53 +253,106 @@ determine_sni_ip() {
             return 0
             ;;
         auto|*)
-            local sni=""
-            # Check stable backup node first to eliminate timeout delay from failing primary node
-            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
-                echo "$BACKUP_SNI_IP"
+            local prof
+            prof=$(get_active_profile)
+            if [ "$prof" = "geohide-us" ]; then
+                find_best_sni_node "generativelanguage.googleapis.com" $GEOHIDE_US_SNI_NODES && return 0
+            else
+                # For geohide-eu, dns-ai and geohide-ru: GeoHide EU is the fastest and most reliable for Google AI
+                find_best_sni_node "generativelanguage.googleapis.com" $GEOHIDE_EU_SNI_NODES && return 0
+                find_best_sni_node "generativelanguage.googleapis.com" $GEOHIDE_US_SNI_NODES && return 0
+            fi
+            # If all SNI proxies fail, fall back to direct Google Anycast to prevent blackholing traffic
+            if verify_sni_tls "generativelanguage.googleapis.com" "172.217.117.4" 1.5; then
+                echo "172.217.117.4"
                 return 0
             fi
-            if command -v resolvectl &>/dev/null; then
-                sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
-            fi
-            if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]] && [[ "$sni" != "$BACKUP_SNI_IP" ]]; then
-                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 2.0; then
-                    echo "$sni"
-                    return 0
-                fi
-            fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 1.5; then
-                echo "$PRIMARY_SNI_IP"
-                return 0
-            fi
-            # Always fall back to tested BACKUP_SNI_IP so Google AI / AGY never stays broken
-            echo "$BACKUP_SNI_IP"
+            echo ""
             return 0
             ;;
     esac
 }
 
+determine_openai_sni_ip() {
+    local prof
+    prof=$(get_active_profile)
+    case "$prof" in
+        geohide-eu)
+            find_best_sni_node "chatgpt.com" $GEOHIDE_EU_SNI_NODES || echo "143.20.64.192"
+            ;;
+        geohide-us)
+            find_best_sni_node "chatgpt.com" $GEOHIDE_US_SNI_NODES || echo "192.255.159.240"
+            ;;
+        geohide-ru)
+            find_best_sni_node "chatgpt.com" $GEOHIDE_RU_SNI_NODES || echo "193.233.112.67"
+            ;;
+        dns-ai|*)
+            if verify_sni_tls "chatgpt.com" "$DNS_AI_SNI_OPENAI" 2.0; then
+                echo "$DNS_AI_SNI_OPENAI"
+            else
+                find_best_sni_node "chatgpt.com" $GEOHIDE_EU_SNI_NODES || echo "$DNS_AI_SNI_OPENAI"
+            fi
+            ;;
+    esac
+}
+
+# ----------------- /etc/hosts Management -----------------
 update_hosts_entry() {
-    local sni_ip="$1"
+    local google_ip="$1"
+    local openai_ip="$2"
+
+    # Remove previous block cleanly
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
 
-    if [ -n "$sni_ip" ]; then
+    if [ -n "$google_ip" ] || [ -n "$openai_ip" ]; then
         cat << HOSTS >> "$HOSTS_FILE"
 # BEGIN DNS-AI-HOSTS
-$sni_ip generativelanguage.googleapis.com
-$sni_ip daily-cloudcode-pa.googleapis.com
-$sni_ip cloudcode-pa.googleapis.com
-$sni_ip cloudaicompanion.googleapis.com
-$sni_ip proactivebackend-pa.googleapis.com
-$sni_ip alkalimakersuite-pa.clients6.google.com
-$sni_ip aicode.googleapis.com
-$sni_ip businessaicode.googleapis.com
-$sni_ip aiplatform.googleapis.com
+# Managed by DNS-AI & GeoHide Console (https://github.com/Falmer-128/dns-ai-tui)
+HOSTS
+
+        if [ -n "$google_ip" ]; then
+            cat << HOSTS >> "$HOSTS_FILE"
+# Google AI & Antigravity ($google_ip)
+$google_ip generativelanguage.googleapis.com
+$google_ip daily-cloudcode-pa.googleapis.com
+$google_ip cloudcode-pa.googleapis.com
+$google_ip cloudaicompanion.googleapis.com
+$google_ip proactivebackend-pa.googleapis.com
+$google_ip alkalimakersuite-pa.clients6.google.com
+$google_ip alkalicore-pa.clients6.google.com
+$google_ip aicode.googleapis.com
+$google_ip businessaicode.googleapis.com
+$google_ip aiplatform.googleapis.com
+$google_ip gemini.google.com
+$google_ip gemini.google
+$google_ip geminiweb-pa.clients.google.com
+$google_ip geminiweb-pa.clients6.google.com
+HOSTS
+        fi
+
+        if [ -n "$openai_ip" ]; then
+            cat << HOSTS >> "$HOSTS_FILE"
+# OpenAI & Claude ($openai_ip)
+$openai_ip chatgpt.com
+$openai_ip www.chatgpt.com
+$openai_ip api.openai.com
+$openai_ip auth0.openai.com
+$openai_ip platform.openai.com
+$openai_ip oaistatic.com
+$openai_ip oaiusercontent.com
+$openai_ip files.oaiusercontent.com
+$openai_ip claude.ai
+$openai_ip api.anthropic.com
+HOSTS
+        fi
+
+        cat << HOSTS >> "$HOSTS_FILE"
 # END DNS-AI-HOSTS
 HOSTS
     fi
 }
 
+# ----------------- NetworkManager & Resolved Routing -----------------
 has_global_v6() {
     ip -6 route show default 2>/dev/null | grep -q default
 }
@@ -201,9 +374,9 @@ nm_apply_ignore_dns() {
 
 nm_restore_dns() {
     command -v nmcli >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
     if [ -s "$CACHE_DIR/nm-connections" ]; then
         while read -r uuid; do
-            [ -n "$uuid" ] || continue
             nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv6.ignore-auto-dns no 2>/dev/null || continue
             dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
             [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
@@ -213,52 +386,47 @@ nm_restore_dns() {
 }
 
 enable_dns() {
-    local custom_v4="$1"
-    local v4="" v6=""
+    local custom_profile="$1"
+    [ -n "$custom_profile" ] && set_active_profile "$custom_profile"
 
-    # Ensure systemd-resolved is active
-    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        systemctl enable --now systemd-resolved 2>/dev/null || true
-    fi
+    local current_prof
+    current_prof=$(get_active_profile)
+    local tls_name
+    tls_name=$(get_profile_tls_name "$current_prof")
+
+    echo -e "${C_CYAN}--> [DNS-AI] Активация профиля:${C_RESET} ${C_BOLD}$(get_profile_name "$current_prof")${C_RESET}"
 
     # Ensure /etc/resolv.conf points to systemd-resolved stub
-    if [ -d /run/systemd/resolve ] || [ -f /run/systemd/resolve/stub-resolv.conf ]; then
-        if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf 2>/dev/null)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
-            [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
-            rm -f /etc/resolv.conf
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        fi
+    if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
     fi
 
-    if [ -n "$custom_v4" ]; then
-        v4="$custom_v4"
-        v6=""
-        echo -e "${C_CYAN}--> [DNS-AI] Использование ручных IP:${C_RESET} $v4"
-    else
-        local ips
-        ips=$(get_current_ips)
-        v4=$(echo "$ips" | cut -d'|' -f1)
-        v6=$(echo "$ips" | cut -d'|' -f2)
-        echo -e "${C_CYAN}--> [DNS-AI] Официальные эндпоинты:${C_RESET} $v4"
-    fi
+    local ips
+    ips=$(get_profile_dns_servers "$current_prof")
+    local v4
+    v4=$(echo "$ips" | cut -d'|' -f1)
+    local v6
+    v6=$(echo "$ips" | cut -d'|' -f2)
 
     local dns_entries=""
     for ip in $v4; do
-        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
+        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$tls_name"
     done
-    if has_global_v6; then
+    if has_global_v6 && [ -n "$v6" ]; then
         for ip in $v6; do
-            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
+            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$tls_name"
         done
     fi
 
     cat << CONF > "$CONFIG_FILE"
-# DNS-AI — systemd-resolved configuration
+# DNS-AI & GeoHide — systemd-resolved configuration
+# Generated on: $(date '+%Y-%m-%d %H:%M:%S')
 [Resolve]
 DNS=${dns_entries# }
 DNSOverTLS=yes
 Domains=~.
-FallbackDNS=
+FallbackDNS=1.1.1.1 8.8.8.8
+DNSSEC=no
 CONF
 
     # Prevent NetworkManager from pushing ISP/DHCP DNS to per-interface resolvers
@@ -267,16 +435,20 @@ CONF
     systemctl restart systemd-resolved 2>/dev/null || true
     resolvectl flush-caches 2>/dev/null || true
 
-    local sni_ip
-    sni_ip=$(determine_sni_ip)
-    if [ -n "$sni_ip" ]; then
-        update_hosts_entry "$sni_ip"
-        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
-        echo -e "${C_GREEN}✓ Google AI / Antigravity направлены на SNI-узел:${C_RESET} ${C_WHITE}$sni_ip${C_RESET}"
-    else
-        update_hosts_entry ""
-        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
-        echo -e "${C_YELLOW}⚠ Внимание: Ни один SNI-узел Google AI не ответил по TLS. Оверрайд /etc/hosts пропущен.${C_RESET}"
+    # Resolve and inject AI SNI proxies
+    echo -e "${C_CYAN}--> Проверка и выбор живых SNI узлов для нейросетей...${C_RESET}"
+    local google_ip openai_ip
+    google_ip=$(determine_google_sni_ip)
+    openai_ip=$(determine_openai_sni_ip)
+
+    update_hosts_entry "$google_ip" "$openai_ip"
+
+    echo -e "${C_GREEN}✓ Защищенный DNS ($tls_name) активирован глобально!${C_RESET}"
+    if [ -n "$google_ip" ]; then
+        echo -e "${C_GREEN}✓ Google AI / Antigravity направлены на:${C_RESET} ${C_WHITE}$google_ip${C_RESET}"
+    fi
+    if [ -n "$openai_ip" ]; then
+        echo -e "${C_GREEN}✓ ChatGPT / Claude AI направлены на:${C_RESET} ${C_WHITE}$openai_ip${C_RESET}"
     fi
 }
 
@@ -288,7 +460,7 @@ disable_dns() {
 
     systemctl restart systemd-resolved 2>/dev/null || true
     resolvectl flush-caches 2>/dev/null || true
-    echo -e "${C_YELLOW}✓ DNS-AI ВЫКЛЮЧЕН. Восстановлены стандартные настройки DNS и hosts.${C_RESET}"
+    echo -e "${C_YELLOW}✓ DNS отключен. Восстановлены стандартные настройки DNS и hosts.${C_RESET}"
 }
 
 toggle_dns() {
@@ -319,13 +491,19 @@ get_active_sni_in_hosts() {
 
 get_current_sni_mode_desc() {
     local mode="auto"
-    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+    if [ -f "$SNI_MODE_FILE" ]; then
+        mode=$(cat "$SNI_MODE_FILE" 2>/dev/null | tr -d ' \n')
+    elif [ -f "$CACHE_DIR/sni_mode" ]; then
+        mode=$(cat "$CACHE_DIR/sni_mode" 2>/dev/null | tr -d ' \n')
+    fi
     case "$mode" in
-        backup) echo "Принудительно резерв ($BACKUP_SNI_IP)" ;;
-        primary) echo "Принудительно основной ($PRIMARY_SNI_IP)" ;;
-        none|disabled) echo "Отключен" ;;
-        manual:*) echo "Ручной (${mode#manual:})" ;;
-        auto|*) echo "Автоматический выбор (с проверкой TLS)" ;;
+        geohide-eu)     echo "Принудительно GeoHide EU (Европа)" ;;
+        geohide-us)     echo "Принудительно GeoHide US (США)" ;;
+        primary)        echo "Принудительно DNS-AI Primary ($DNS_AI_SNI_PRIMARY)" ;;
+        direct|bypass)  echo "Прямой доступ (Google Direct Anycast)" ;;
+        none|disabled)  echo "Отключен" ;;
+        manual:*)       echo "Ручной (${mode#manual:})" ;;
+        auto|*)         echo "Автовыбор (быстрый живой узел с TLS)" ;;
     esac
 }
 
@@ -333,11 +511,10 @@ get_current_sni_mode_desc() {
 manage_autostart() {
     local action="$1"
 
-    # Ensure systemd service exists in /etc/systemd/system
     if [ ! -f "/etc/systemd/system/$SERVICE_NAME" ]; then
         cat << SERVICE > "/etc/systemd/system/$SERVICE_NAME"
 [Unit]
-Description=DNS-AI Encrypted DNS and AI Services Routing
+Description=DNS-AI & GeoHide Encrypted DNS and AI Services Routing
 Documentation=https://github.com/Falmer-128/dns-ai-tui
 After=network-online.target systemd-resolved.service
 Wants=network-online.target systemd-resolved.service
@@ -351,19 +528,18 @@ ExecStop=/usr/local/bin/dns-ai off
 [Install]
 WantedBy=multi-user.target
 SERVICE
+        chmod 644 "/etc/systemd/system/$SERVICE_NAME"
         systemctl daemon-reload 2>/dev/null || true
     fi
 
     case "$action" in
         enable)
             systemctl enable "$SERVICE_NAME" 2>/dev/null
-            systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_GREEN}✓ Служба $SERVICE_NAME успешно добавлена в автозагрузку!${C_RESET}"
+            echo -e "${C_GREEN}✓ Автозагрузка включена (systemd service enabled).${C_RESET}"
             ;;
         disable)
             systemctl disable "$SERVICE_NAME" 2>/dev/null
-            systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_YELLOW}✓ Служба $SERVICE_NAME успешно убрана из автозагрузки!${C_RESET}"
+            echo -e "${C_YELLOW}✓ Автозагрузка отключена.${C_RESET}"
             ;;
         toggle)
             if is_autostart_enabled; then
@@ -372,59 +548,174 @@ SERVICE
                 manage_autostart enable
             fi
             ;;
-        status)
-            if is_autostart_enabled; then
-                echo -e "Автозагрузка: ${C_GREEN}ВКЛЮЧЕНА (systemd enabled)${C_RESET}"
-            else
-                echo -e "Автозагрузка: ${C_YELLOW}ОТКЛЮЧЕНА (systemd disabled)${C_RESET}"
-            fi
-            ;;
     esac
 }
 
-# ----------------- Diagnostic Test -----------------
-run_full_test() {
+# ----------------- Online IP Check & Diff Detection -----------------
+check_for_ip_updates() {
+    local interactive="${1:-false}"
+
+    local py_out
+    py_out=$(python3 -c "
+import urllib.request, json, time, re, sys
+
+cache_file = '$METADATA_FILE'
+system_cache = '$STATE_DIR/metadata.json'
+
+stored_data = {}
+for p in [cache_file, system_cache]:
+    try:
+        with open(p, 'r') as f:
+            stored_data = json.load(f)
+            break
+    except Exception:
+        pass
+
+update_found = False
+change_details = []
+
+# 1. Check DNS-AI
+try:
+    req = urllib.request.urlopen('https://dns-ai.ru/endpoints.json', timeout=2.5)
+    current_dns_ai = json.loads(req.read().decode('utf-8'))
+    new_serial = current_dns_ai.get('serial', 0)
+    old_serial = stored_data.get('dns_ai_serial', 0)
+    if new_serial > old_serial and old_serial > 0:
+        update_found = True
+        change_details.append(f'DNS-AI: Новая ревизия Serial {new_serial} (было: Serial {old_serial})')
+        change_details.append(f'  Актуальные серверы: {\", \".join(current_dns_ai.get(\"v4\", []))}')
+        if current_dns_ai.get('retired'):
+            change_details.append(f'  Выведены из работы: {\", \".join(current_dns_ai.get(\"retired\", [])[-2:])}')
+    stored_data['dns_ai_serial'] = new_serial
+    stored_data['dns_ai_v4'] = current_dns_ai.get('v4', [])
+except Exception:
+    pass
+
+# 2. Check GeoHide EU
+try:
+    req = urllib.request.Request('https://geohide.ru/eu/hosts', headers={'Range': 'bytes=0-300', 'User-Agent': 'curl/8.0'})
+    res = urllib.request.urlopen(req, timeout=2.5).read().decode('utf-8', errors='ignore')
+    m = re.search(r'Последнее обновление:\s*([^\r\n]+)', res)
+    if m:
+        new_date = m.group(1).strip()
+        old_date = stored_data.get('geohide_eu_date', '')
+        if old_date and new_date != old_date:
+            update_found = True
+            change_details.append(f'GeoHide: База обновлена от {new_date} (было: {old_date})')
+        stored_data['geohide_eu_date'] = new_date
+except Exception:
+    pass
+
+# Save updated metadata
+try:
+    with open(cache_file, 'w') as f:
+        json.dump(stored_data, f, indent=2)
+except Exception:
+    pass
+
+if update_found:
+    print('UPDATE_AVAILABLE')
+    for d in change_details:
+        print(d)
+    sys.exit(10)
+else:
+    print('UP_TO_DATE')
+    sys.exit(0)
+" 2>/dev/null)
+    local ret=$?
+
+    if [ $ret -eq 10 ]; then
+        if [ "$interactive" = "true" ]; then
+            clear
+            echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+            echo -e "${C_CYAN}║               Обнаружено обновление серверов онлайн!               ║${C_RESET}"
+            echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+            echo ""
+            echo -e "  ${C_YELLOW}В официальных репозиториях DNS-AI / GeoHide изменились серверы:${C_RESET}"
+            echo ""
+            echo "$py_out" | sed '1d' | while IFS= read -r line; do
+                echo -e "  $line"
+            done
+            echo ""
+            echo -ne "  ${C_CYAN}Применить обновленные IP-адреса сейчас? [Y/n]: ${C_RESET}"
+            read -r ans
+            case "$ans" in
+                n|N|no|No)
+                    echo -e "${C_GRAY}Обновление пропущено.${C_RESET}"
+                    sleep 0.8
+                    ;;
+                *)
+                    echo -e "${C_GREEN}--> Применение обновленных адресов...${C_RESET}"
+                    fetch_dns_ai_endpoints >/dev/null 2>&1 || true
+                    if is_active; then
+                        enable_dns
+                    fi
+                    echo -e "${C_GREEN}✓ База адресов успешно обновлена!${C_RESET}"
+                    sleep 1.5
+                    ;;
+            esac
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# ----------------- Comprehensive Diagnostics Engine -----------------
+run_diagnostics() {
+    local interactive="${1:-false}"
+    clear
     echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║                Комплексная диагностика DNS-AI                      ║${C_RESET}"
+    echo -e "${C_CYAN}║             Комплексная диагностика DNS-AI и GeoHide               ║${C_RESET}"
     echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
 
     python3 -c "
 import socket, ssl, time, json, urllib.request
 
-print('\033[1;36m[1] Проверка официального списка endpoints.json:\033[0m')
-data = None
-for url in ['https://dns-ai.ru/endpoints.json', 'https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json']:
-    try:
-        t0 = time.time()
-        req = urllib.request.urlopen(url, timeout=4)
-        data = json.loads(req.read().decode('utf-8'))
-        dt = (time.time() - t0) * 1000
-        print(f'    \033[1;32m✓\033[0m {url} \033[0;90m({dt:.0f}ms, Serial {data.get(\"serial\", \"?\")})\033[0m')
-        break
-    except Exception as e:
-        print(f'    \033[1;31m✗\033[0m {url} \033[0;90m({e})\033[0m')
+print('\033[1;36m[1] Проверка источников списков серверов:\033[0m')
+try:
+    t0 = time.time()
+    req = urllib.request.urlopen('https://dns-ai.ru/endpoints.json', timeout=3)
+    data = json.loads(req.read().decode('utf-8'))
+    dt = (time.time() - t0)*1000
+    print(f'    \033[1;32m✓\033[0m DNS-AI endpoints.json (Serial {data.get(\"serial\", \"?\")}) \033[0;90m({dt:.0f}ms)\033[0m')
+except Exception as e:
+    print(f'    \033[1;31m✗\033[0m DNS-AI endpoints.json \033[0;90m({e})\033[0m')
 
-v4_list = data.get('v4', ['194.87.196.13', '45.151.102.219']) if data else ['194.87.196.13', '45.151.102.219']
-retired = data.get('retired', []) if data else []
+try:
+    t0 = time.time()
+    req = urllib.request.Request('https://geohide.ru/eu/hosts', headers={'Range': 'bytes=0-300', 'User-Agent': 'curl/8.0'})
+    res = urllib.request.urlopen(req, timeout=3).read().decode('utf-8', errors='ignore')
+    dt = (time.time() - t0)*1000
+    print(f'    \033[1;32m✓\033[0m GeoHide EU hosts database \033[0;90m({dt:.0f}ms)\033[0m')
+except Exception as e:
+    print(f'    \033[1;31m✗\033[0m GeoHide hosts \033[0;90m({e})\033[0m')
 
 print('\n\033[1;36m[2] Проверка серверов DNS-over-TLS (Порт 853):\033[0m')
-for ip in v4_list:
+dot_targets = [
+    ('DNS-AI msk7', '45.151.102.219', 'dns.dns-ai.ru'),
+    ('DNS-AI spb7', '194.87.196.13', 'dns.dns-ai.ru'),
+    ('GeoHide EU #1', '143.20.64.192', 'eu.geohide.ru'),
+    ('GeoHide EU #2', '45.13.237.213', 'eu.geohide.ru'),
+    ('GeoHide US #1', '192.255.159.240', 'us.geohide.ru'),
+    ('GeoHide US #2', '192.255.159.241', 'us.geohide.ru'),
+    ('GeoHide RU #1', '193.233.112.67', 'geohide.ru'),
+    ('GeoHide RU #2', '193.233.112.68', 'geohide.ru')
+]
+
+for label, ip, tls_name in dot_targets:
     t0 = time.time()
     try:
-        s = socket.create_connection((ip, 853), timeout=3)
+        s = socket.create_connection((ip, 853), timeout=2.5)
         ctx = ssl.create_default_context()
-        ss = ctx.wrap_socket(s, server_hostname='dns.dns-ai.ru')
-        dt = (time.time() - t0) * 1000
+        ss = ctx.wrap_socket(s, server_hostname=tls_name)
+        dt = (time.time() - t0)*1000
         ss.close()
-        print(f'    \033[1;32m✓\033[0m {ip}:853 DoT доступен \033[0;90m({dt:.1f}ms)\033[0m')
+        print(f'    \033[1;32m✓\033[0m {label:<16} [{ip}]: DoT OK \033[0;90m({dt:.1f}ms)\033[0m')
     except Exception as e:
-        print(f'    \033[1;31m✗\033[0m {ip}:853 DoT ОШИБКА \033[0;90m({e})\033[0m')
-
-for ip in retired:
-    print(f'    \033[0;90mℹ {ip} — выведен из эксплуатации (retired upstream)\033[0m')
+        print(f'    \033[1;31m✗\033[0m {label:<16} [{ip}]: DoT FAIL \033[0;90m({e})\033[0m')
 
 print('\n\033[1;36m[3] Проверка промежуточных SNI-прокси для ИИ (Порт 443 TLS):\033[0m')
-def test_sni(host, ip, timeout=3):
+def test_sni(host, ip, timeout=2.5):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -434,49 +725,79 @@ def test_sni(host, ip, timeout=3):
     try:
         s.connect((ip, 443))
         ss = ctx.wrap_socket(s, server_hostname=host)
-        dt = (time.time() - t0) * 1000
+        dt = (time.time() - t0)*1000
         ss.close()
         return True, f'OK ({dt:.1f}ms)'
     except Exception as e:
         return False, f'FAIL ({e})'
 
-targets = [
-    ('ChatGPT', 'chatgpt.com', '62.60.230.61'),
-    ('OpenAI API', 'api.openai.com', '62.60.230.61'),
-    ('Claude AI', 'claude.ai', '62.60.230.61'),
-    ('Google AI Primary', 'generativelanguage.googleapis.com', '109.120.131.200'),
-    ('Google AI Backup', 'generativelanguage.googleapis.com', '143.20.64.55'),
+sni_targets = [
+    ('ChatGPT (DNS-AI SE)', 'chatgpt.com', '62.60.230.61', 'DNS-AI (SE)'),
+    ('ChatGPT (GeoHide EU)', 'chatgpt.com', '143.20.64.192', 'GeoHide (EU)'),
+    ('Claude AI (DNS-AI SE)', 'claude.ai', '62.60.230.61', 'DNS-AI (SE)'),
+    ('Claude AI (GeoHide EU)', 'claude.ai', '143.20.64.192', 'GeoHide (EU)'),
+    ('Google AI (GeoHide EU #1)', 'generativelanguage.googleapis.com', '143.20.64.192', 'GeoHide (EU)'),
+    ('Google AI (GeoHide EU #2)', 'generativelanguage.googleapis.com', '45.13.237.213', 'GeoHide (EU)'),
+    ('Antigravity Auth (EU)', 'daily-cloudcode-pa.googleapis.com', '143.20.64.192', 'GeoHide (EU)'),
+    ('Gemini Web (EU)', 'gemini.google.com', '143.20.64.192', 'GeoHide (EU)'),
+    ('Google AI (GeoHide US)', 'generativelanguage.googleapis.com', '192.255.159.240', 'GeoHide (US)'),
+    ('Google AI (DNS-AI Primary)', 'generativelanguage.googleapis.com', '109.120.131.200', 'DNS-AI (US)'),
+    ('Google AI (Direct Anycast)', 'generativelanguage.googleapis.com', '172.217.117.4', 'Google Anycast')
 ]
 
-for label, host, ip in targets:
+for label, host, ip, provider in sni_targets:
     ok, res = test_sni(host, ip)
     icon = '\033[1;32m✓\033[0m' if ok else '\033[1;31m✗\033[0m'
-    status_color = '\033[0;32m' if ok else '\033[0;31m'
-    print(f'    {icon} {label:<20} [{ip}]: {status_color}{res}\033[0m')
+    color = '\033[0;32m' if ok else '\033[0;31m'
+    note = ''
+    if not ok and '109.120.131.200' in ip:
+        note = ' \033[0;90m(узел DNS-AI упал — переключитесь на GeoHide EU)\033[0m'
+    print(f'    {icon} {label:<27} [{ip:<15} {provider}]: {color}{res}\033[0m{note}')
 
-print('\n\033[1;36m[4] Текущая локальная резолюция в системе:\033[0m')
-try:
-    infos = socket.getaddrinfo('generativelanguage.googleapis.com', 443)
-    ips = list(set([item[4][0] for item in infos]))
-    print(f'    generativelanguage.googleapis.com -> \033[1;37m{ips[:3]}\033[0m')
-except Exception as e:
-    print(f'    \033[1;31m✗ Ошибка резолва: {e}\033[0m')
+print('\n\033[1;36m[4] Текущая резолюция системы (resolvectl):\033[0m')
+for d in ['chatgpt.com', 'generativelanguage.googleapis.com']:
+    try:
+        infos = socket.getaddrinfo(d, 443)
+        ips = list(set([item[4][0] for item in infos]))
+        print(f'    {d:<35} -> \033[1;37m{ips[:3]}\033[0m')
+    except Exception as e:
+        print(f'    {d:<35} -> \033[1;31mОшибка: {e}\033[0m')
 
-print('\n\033[1;36m[5] Проверка признака работы DNS-AI (check.dns-ai.ru):\033[0m')
+print('\n\033[1;36m[5] Проверка признака активности шифрованного DNS:\033[0m')
 try:
     check_ip = socket.gethostbyname('check.dns-ai.ru')
-    print(f'    \033[1;32m✓\033[0m check.dns-ai.ru -> \033[1;32m{check_ip}\033[0m \033[0;32m(DoT DNS-AI подтвержден ОС!)\033[0m')
+    print(f'    \033[1;32m✓\033[0m check.dns-ai.ru -> \033[1;32m{check_ip}\033[0m \033[0;32m(DNS-AI DoT подтвержден!)\033[0m')
 except Exception:
-    print('    \033[1;31m✗\033[0m check.dns-ai.ru не разрешился.')
-    print('      \033[1;33mℹ Подсказка: Запросы идут через роутер/провайдер, а не через DNS-AI.\033[0m')
+    print('    \033[0;90m○ check.dns-ai.ru: не активен (активен GeoHide либо стандартный DNS)\033[0m')
+
+try:
+    geo_ip = socket.gethostbyname('dnstest.geohide.ru')
+    print(f'    \033[1;32m✓\033[0m dnstest.geohide.ru -> \033[1;32m{geo_ip}\033[0m \033[0;32m(GeoHide DoT подтвержден!)\033[0m')
+except Exception:
+    print('    \033[0;90m○ dnstest.geohide.ru: не активен (активен DNS-AI либо стандартный DNS)\033[0m')
 "
     echo -e "${C_CYAN}════════════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    if [ "$interactive" = "true" ]; then
+        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+    fi
 }
 
+# ----------------- System Status Viewer -----------------
 show_status() {
+    local interactive="${1:-false}"
+    clear
+    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║                     Текущий статус сети                            ║${C_RESET}"
+    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+
+    local prof
+    prof=$(get_active_profile)
+    echo -e "Активный профиль: ${C_BOLD}$(get_profile_name "$prof")${C_RESET}"
+    echo ""
     echo -e "${C_CYAN}--- Глобальная конфигурация systemd-resolved ---${C_RESET}"
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "Статус: ${C_GREEN}[ АКТИВЕН ]${C_RESET}"
+        echo -e "Статус: ${C_GREEN}[ РАБОТАЕТ ]${C_RESET}"
         cat "$CONFIG_FILE"
     else
         echo -e "Статус: ${C_YELLOW}[ ВЫКЛЮЧЕН ]${C_RESET}"
@@ -486,83 +807,63 @@ show_status() {
     if grep -q "BEGIN DNS-AI-HOSTS" "$HOSTS_FILE" 2>/dev/null; then
         sed -n '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/p' "$HOSTS_FILE"
     else
-        echo "Записи DNS-AI в /etc/hosts отсутствуют."
-    fi
-    echo ""
-    echo -e "${C_CYAN}--- Проверка авторизации DoT (check.dns-ai.ru) ---${C_RESET}"
-    local check_ip
-    check_ip=$(resolvectl query check.dns-ai.ru 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
-    if [ -n "$check_ip" ]; then
-        echo -e "  Признак DNS-AI: ${C_GREEN}● ПОДТВЕРЖДЕНО ($check_ip)${C_RESET}"
-    else
-        echo -e "  Признак DNS-AI: ${C_RED}○ НЕ ОПРЕДЕЛЕН (запросы идут не через DNS-AI)${C_RESET}"
-        echo -e "  ${C_GRAY}Примечание: В браузере (Firefox/Chrome) отключите 'DNS over HTTPS' (DoH),${C_RESET}"
-        echo -e "  ${C_GRAY}чтобы браузер не ходил в обход системного DNS-over-TLS.${C_RESET}"
+        echo "Записи DNS-AI / GeoHide в /etc/hosts отсутствуют."
     fi
     echo ""
     echo -e "${C_CYAN}--- Активное состояние resolved ---${C_RESET}"
-    resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers|DNSOverTLS|Link " | head -n 12 || true
+    resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers|DNSOverTLS|Link " | head -n 14 || true
+    echo ""
+    if [ "$interactive" = "true" ]; then
+        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+    fi
 }
 
 # ----------------- TUI Submenus -----------------
-menu_sni_settings() {
+menu_select_profile() {
     while true; do
         clear
         echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_CYAN}║         Настройка Google AI SNI узла             ║${C_RESET}"
+        echo -e "${C_CYAN}║        Выбор профиля шифрованного DNS            ║${C_RESET}"
         echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
-        echo -e "  Текущий режим:  ${C_WHITE}$(get_current_sni_mode_desc)${C_RESET}"
-        local active_ip
-        active_ip=$(get_active_sni_in_hosts)
-        if [ -n "$active_ip" ]; then
-            echo -e "  Активен в hosts: ${C_GREEN}$active_ip${C_RESET}"
-        else
-            echo -e "  Активен в hosts: ${C_YELLOW}нет оверрайда${C_RESET}"
-        fi
+        local cur
+        cur=$(get_active_profile)
+        echo -e "  Текущий профиль: ${C_BOLD}$(get_profile_name "$cur")${C_RESET}"
         echo ""
         echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
-        echo -e "  ${C_GREEN}1)${C_RESET} Автоматический выбор (проверка TLS при старте) [Рекомендуется]"
-        echo -e "  ${C_CYAN}2)${C_RESET} Принудительно резервный узел ($BACKUP_SNI_IP) [Проверен и стабилен]"
-        echo -e "  ${C_YELLOW}3)${C_RESET} Принудительно основной узел ($PRIMARY_SNI_IP)"
-        echo -e "  ${C_MAGENTA}4)${C_RESET} Указать свой IP вручную"
-        echo -e "  ${C_RED}5)${C_RESET} Отключить оверрайд Google AI"
+        echo -e "  ${C_GREEN}1)${C_RESET} ${C_BOLD}GeoHide EU (Европа)${C_RESET} [Рекомендуется для Google AI, ChatGPT, Claude]"
+        echo -e "  ${C_CYAN}2)${C_RESET} ${C_BOLD}GeoHide US (США)${C_RESET} [Маршрутизация всех зарубежных ИИ через США]"
+        echo -e "  ${C_MAGENTA}3)${C_RESET} ${C_BOLD}GeoHide RU (Россия)${C_RESET} [Обход зарубежных блокировок сайтов РФ]"
+        echo -e "  ${C_YELLOW}4)${C_RESET} ${C_BOLD}DNS-AI (dns.dns-ai.ru)${C_RESET} [Классический профиль DNS-AI]"
         echo ""
-        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-5]: ${C_RESET}")" sni_choice
-        case "$sni_choice" in
+        read -p "$(echo -e "${C_CYAN}Выберите профиль [0-4]: ${C_RESET}")" p_choice
+        case "$p_choice" in
             1)
-                echo "auto" > "$MODE_FILE"
+                set_active_profile "geohide-eu"
                 if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен автоматический режим!${C_RESET}"
-                sleep 1.5
+                echo -e "${C_GREEN}✓ Выбран профиль GeoHide EU!${C_RESET}"
+                sleep 1.2
+                break
                 ;;
             2)
-                echo "backup" > "$MODE_FILE"
+                set_active_profile "geohide-us"
                 if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен резервный узел ($BACKUP_SNI_IP)!${C_RESET}"
-                sleep 1.5
+                echo -e "${C_GREEN}✓ Выбран профиль GeoHide US!${C_RESET}"
+                sleep 1.2
+                break
                 ;;
             3)
-                echo "primary" > "$MODE_FILE"
+                set_active_profile "geohide-ru"
                 if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен основной узел ($PRIMARY_SNI_IP)!${C_RESET}"
-                sleep 1.5
+                echo -e "${C_GREEN}✓ Выбран профиль GeoHide RU!${C_RESET}"
+                sleep 1.2
+                break
                 ;;
             4)
-                read -p "Введите IP адрес SNI прокси: " manual_ip
-                if [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo "manual:$manual_ip" > "$MODE_FILE"
-                    if is_active; then enable_dns; fi
-                    echo -e "${C_GREEN}✓ Установлен пользовательский узел ($manual_ip)!${C_RESET}"
-                else
-                    echo -e "${C_RED}Некорректный IP адрес!${C_RESET}"
-                fi
-                sleep 2
-                ;;
-            5)
-                echo "none" > "$MODE_FILE"
-                update_hosts_entry ""
-                echo -e "${C_YELLOW}✓ Оверрайд Google AI отключен!${C_RESET}"
-                sleep 1.5
+                set_active_profile "dns-ai"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Выбран профиль DNS-AI!${C_RESET}"
+                sleep 1.2
+                break
                 ;;
             0|"")
                 break
@@ -575,17 +876,88 @@ menu_sni_settings() {
     done
 }
 
-menu_custom_dns() {
-    clear
-    echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║         Выбор пользовательских DNS серверов      ║${C_RESET}"
-    echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
-    echo "Введите один или два IPv4 адреса через пробел (или Enter для отмены):"
-    read -p "DNS IP: " custom_input
-    if [ -n "$custom_input" ]; then
-        enable_dns "$custom_input"
-        read -p "$(echo -e "${C_CYAN}Нажмите Enter для продолжения...${C_RESET}")"
-    fi
+menu_sni_settings() {
+    while true; do
+        clear
+        echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
+        echo -e "${C_CYAN}║     Настройка Google AI / Antigravity SNI        ║${C_RESET}"
+        echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
+        echo -e "  Текущий режим:   ${C_WHITE}$(get_current_sni_mode_desc)${C_RESET}"
+        local active_ip
+        active_ip=$(get_active_sni_in_hosts)
+        if [ -n "$active_ip" ]; then
+            echo -e "  Активен в hosts: ${C_GREEN}$active_ip${C_RESET}"
+        else
+            echo -e "  Активен в hosts: ${C_YELLOW}без оверрайда${C_RESET}"
+        fi
+        echo ""
+        echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
+        echo -e "  ${C_GREEN}1)${C_RESET} Автовыбор (проверка TLS и выбор живого узла) [Рекомендуется]"
+        echo -e "  ${C_CYAN}2)${C_RESET} Принудительно GeoHide EU (Европейский прокси — Google видит ЕС)"
+        echo -e "  ${C_MAGENTA}3)${C_RESET} Принудительно GeoHide US (Американский прокси — Google видит США)"
+        echo -e "  ${C_WHITE}4)${C_RESET} Прямой доступ (Google Direct Anycast — напрямую без прокси)"
+        echo -e "  ${C_YELLOW}5)${C_RESET} Принудительно DNS-AI Primary ($DNS_AI_SNI_PRIMARY) [Внимание: сейчас в дауне]"
+        echo -e "  ${C_BLUE}6)${C_RESET} Указать свой IP вручную"
+        echo -e "  ${C_RED}7)${C_RESET} Отключить оверрайд Google AI"
+        echo ""
+        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-7]: ${C_RESET}")" sni_choice
+        case "$sni_choice" in
+            1)
+                set_sni_mode "auto"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен автоматический режим!${C_RESET}"
+                sleep 1.2
+                ;;
+            2)
+                set_sni_mode "geohide-eu"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен узел GeoHide EU!${C_RESET}"
+                sleep 1.2
+                ;;
+            3)
+                set_sni_mode "geohide-us"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен узел GeoHide US!${C_RESET}"
+                sleep 1.2
+                ;;
+            4)
+                set_sni_mode "direct"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен прямой доступ Google Direct Anycast!${C_RESET}"
+                sleep 1.2
+                ;;
+            5)
+                set_sni_mode "primary"
+                if is_active; then enable_dns; fi
+                echo -e "${C_YELLOW}✓ Установлен основной узел DNS-AI ($DNS_AI_SNI_PRIMARY)!${C_RESET}"
+                sleep 1.2
+                ;;
+            6)
+                read -p "Введите IP адрес SNI прокси: " manual_ip
+                if [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    set_sni_mode "manual:$manual_ip"
+                    if is_active; then enable_dns; fi
+                    echo -e "${C_GREEN}✓ Установлен пользовательский узел ($manual_ip)!${C_RESET}"
+                else
+                    echo -e "${C_RED}Некорректный IP адрес!${C_RESET}"
+                fi
+                sleep 1.5
+                ;;
+            7)
+                set_sni_mode "none"
+                update_hosts_entry "" "$(determine_openai_sni_ip)"
+                echo -e "${C_YELLOW}✓ Оверрайд Google AI отключен!${C_RESET}"
+                sleep 1.2
+                ;;
+            0|"")
+                break
+                ;;
+            *)
+                echo -e "${C_RED}Неверный выбор!${C_RESET}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 menu_autostart() {
@@ -601,24 +973,18 @@ menu_autostart() {
         fi
         echo ""
         echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
-        if is_autostart_enabled; then
-            echo -e "  ${C_RED}1)${C_RESET} Убрать из автозагрузки (systemctl disable)"
-        else
-            echo -e "  ${C_GREEN}1)${C_RESET} Добавить в автозагрузку (systemctl enable)"
-        fi
-        echo -e "  ${C_CYAN}2)${C_RESET} Проверить статус службы (systemctl status)"
+        echo -e "  ${C_GREEN}1)${C_RESET} Включить автозагрузку"
+        echo -e "  ${C_RED}2)${C_RESET} Отключить автозагрузку"
         echo ""
         read -p "$(echo -e "${C_CYAN}Выберите пункт [0-2]: ${C_RESET}")" auto_choice
         case "$auto_choice" in
             1)
-                manage_autostart toggle
+                manage_autostart enable
                 sleep 1.5
                 ;;
             2)
-                clear
-                systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+                manage_autostart disable
+                sleep 1.5
                 ;;
             0|"")
                 break
@@ -631,50 +997,41 @@ menu_autostart() {
     done
 }
 
-# ----------------- Self-Update from GitHub -----------------
-self_update() {
+# ----------------- Self-Update Engine -----------------
+upgrade_self() {
     clear
     echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║              Обновление программы DNS-AI из GitHub                 ║${C_RESET}"
+    echo -e "${C_CYAN}║               Обновление программы из GitHub                       ║${C_RESET}"
     echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
-    echo -e "Проверка обновлений в репозитории: ${C_WHITE}https://github.com/Falmer-128/dns-ai-tui${C_RESET}"
-    echo ""
 
     local tmp_dir
     tmp_dir=$(mktemp -d /tmp/dns-ai-update.XXXXXX)
 
-    # 1. If running inside a git repository, pull latest changes
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-    if [ -d "$script_dir/.git" ] && command -v git >/dev/null 2>&1; then
+    if [ -d "$script_dir/.git" ]; then
         echo -e "${C_CYAN}--> Обнаружен Git-репозиторий в $script_dir...${C_RESET}"
         git -C "$script_dir" pull origin main 2>&1 || git -C "$script_dir" pull 2>&1 || true
     fi
 
-    # 2. Download latest binary from GitHub
     echo -e "${C_CYAN}--> Загрузка актуальной версии dns-ai с GitHub...${C_RESET}"
     if ! curl -fsSL --max-time 15 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai" -o "$tmp_dir/dns-ai"; then
         echo -e "${C_RED}✗ Ошибка: Не удалось скачать файл обновления. Проверьте сеть.${C_RESET}"
         rm -rf "$tmp_dir"
-        echo ""
         read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
         return 1
     fi
 
-    # 3. Syntax check
     if ! bash -n "$tmp_dir/dns-ai" 2>/dev/null; then
-        echo -e "${C_RED}✗ Ошибка: Загруженный скрипт поврежден (синтаксическая ошибка). Обновление отменено.${C_RESET}"
+        echo -e "${C_RED}✗ Ошибка: Загруженный скрипт содержит синтаксическую ошибку.${C_RESET}"
         rm -rf "$tmp_dir"
-        echo ""
         read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
         return 1
     fi
 
-    # 4. Download latest systemd service
     curl -fsSL --max-time 10 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai.service" -o "$tmp_dir/dns-ai.service" 2>/dev/null || true
 
-    # 5. Install binary
-    echo -e "${C_CYAN}--> Применение обновления...${C_RESET}"
+    echo -e "${C_CYAN}--> Применение новой версии...${C_RESET}"
     mkdir -p /usr/local/bin
     cp -f "$tmp_dir/dns-ai" /usr/local/bin/dns-ai
     chmod 755 /usr/local/bin/dns-ai
@@ -691,7 +1048,7 @@ self_update() {
     echo -e "${C_GREEN}✓ Программа успешно обновлена до актуальной версии из GitHub!${C_RESET}"
 
     if is_active; then
-        echo -e "${C_CYAN}--> Переприменение обновленной конфигурации DNS-AI...${C_RESET}"
+        echo -e "${C_CYAN}--> Переприменение конфигурации...${C_RESET}"
         enable_dns
     fi
 
@@ -700,47 +1057,57 @@ self_update() {
     exec /usr/local/bin/dns-ai "$@"
 }
 
-# ----------------- Main TUI Menu Loop -----------------
+# ----------------- Main TUI Loop -----------------
 main_tui() {
     trap "clear; exit 0" SIGINT SIGTERM
+
+    # Fast startup check for upstream updates
+    check_for_ip_updates "true"
+
     while true; do
         clear
         echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_CYAN}║                  DNS-AI Management Console                         ║${C_RESET}"
+        echo -e "${C_CYAN}║            DNS-AI & GeoHide Management Console (TUI)               ║${C_RESET}"
         echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
 
-        # Status block
+        local cur_prof
+        cur_prof=$(get_active_profile)
+        local cur_tls
+        cur_tls=$(get_profile_tls_name "$cur_prof")
+
+        echo -e "  Активный профиль: ${C_BOLD}${C_GREEN}$(get_profile_name "$cur_prof")${C_RESET}"
+
         if is_active; then
-            echo -e "  Служба DNS-AI:  ${C_GREEN}● РАБОТАЕТ (DoT $TLS_NAME активен)${C_RESET}"
+            echo -e "  Состояние службы: ${C_GREEN}● РАБОТАЕТ (DoT $cur_tls активен)${C_RESET}"
         else
-            echo -e "  Служба DNS-AI:  ${C_RED}○ ВЫКЛЮЧЕН (используется системный DNS)${C_RESET}"
+            echo -e "  Состояние службы: ${C_RED}○ ВЫКЛЮЧЕН (используется системный DNS)${C_RESET}"
         fi
 
         if is_autostart_enabled; then
-            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (systemd service enabled)${C_RESET}"
+            echo -e "  Автозагрузка:     ${C_GREEN}● ВКЛЮЧЕНА (systemd service enabled)${C_RESET}"
         else
-            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА${C_RESET}"
+            echo -e "  Автозагрузка:     ${C_YELLOW}○ ОТКЛЮЧЕНА${C_RESET}"
         fi
 
         local active_sni
         active_sni=$(get_active_sni_in_hosts)
         if [ -n "$active_sni" ]; then
-            echo -e "  Google AI SNI:  ${C_WHITE}$active_sni${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
+            echo -e "  Google AI SNI:    ${C_WHITE}$active_sni${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
         else
-            echo -e "  Google AI SNI:  ${C_YELLOW}без оверрайда${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
+            echo -e "  Google AI SNI:    ${C_YELLOW}без оверрайда${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
         fi
 
-        echo -e "  Резерв DoT:     ${C_GRAY}Два независимых узла DoT (194.87.196.13, 45.151.102.219)${C_RESET}"
+        echo -e "  Защита от утечек: ${C_GRAY}NetworkManager DHCP DNS изолирован, Fallback=1.1.1.1${C_RESET}"
         echo ""
         echo -e "  ${C_BLUE}0)${C_RESET} ${C_BOLD}Выйти${C_RESET}"
-        echo -e "  ${C_GREEN}1)${C_RESET} $( is_active && echo -e "${C_RED}Выключить DNS-AI${C_RESET}" || echo -e "${C_GREEN}Включить DNS-AI${C_RESET}" )"
-        echo -e "  ${C_CYAN}2)${C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)"
-        echo -e "  ${C_MAGENTA}3)${C_RESET} Управление автозагрузкой (Systemd)"
-        echo -e "  ${C_YELLOW}4)${C_RESET} Настройка Google AI SNI узла"
-        echo -e "  ${C_CYAN}5)${C_RESET} Обновить список адресов (endpoints.json с dns-ai.ru)"
-        echo -e "  ${C_GREEN}6)${C_RESET} Обновить программу из GitHub (Self-update)"
-        echo -e "  ${C_WHITE}7)${C_RESET} Ручной ввод DNS IP"
-        echo -e "  ${C_GRAY}8)${C_RESET} Подробная системная сводка (resolvectl)"
+        echo -e "  ${C_GREEN}1)${C_RESET} $( is_active && echo -e "${C_RED}Выключить шифрованный DNS${C_RESET}" || echo -e "${C_GREEN}Включить шифрованный DNS${C_RESET}" )"
+        echo -e "  ${C_CYAN}2)${C_RESET} Сменить профиль (GeoHide EU / US / RU | DNS-AI)"
+        echo -e "  ${C_GREEN}3)${C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)"
+        echo -e "  ${C_YELLOW}4)${C_RESET} Настройка Google AI / Antigravity SNI узла"
+        echo -e "  ${C_MAGENTA}5)${C_RESET} Управление автозагрузкой (Systemd)"
+        echo -e "  ${C_CYAN}6)${C_RESET} Проверить и применить обновление IP серверов (Check & Sync)"
+        echo -e "  ${C_WHITE}7)${C_RESET} Обновить программу из GitHub (Self-update)"
+        echo -e "  ${C_GRAY}8)${C_RESET} Подробная системная сводка (resolvectl status)"
         echo -e "  ${C_RED}9)${C_RESET} Сбросить все настройки сети до стандартных"
         echo ""
         echo -e "  \033[0;90mРепозиторий проекта: https://github.com/Falmer-128/dns-ai-tui\033[0m"
@@ -753,172 +1120,127 @@ main_tui() {
                 sleep 1.2
                 ;;
             2)
-                clear
-                run_full_test
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+                menu_select_profile
                 ;;
             3)
-                menu_autostart
+                run_diagnostics "true"
                 ;;
             4)
                 menu_sni_settings
                 ;;
             5)
-                echo -e "${C_CYAN}--> Загрузка актуальных адресов с dns-ai.ru...${C_RESET}"
-                if fetch_endpoints >/dev/null; then
-                    echo -e "${C_GREEN}✓ Кэш адресов успешно обновлен!${C_RESET}"
-                    if is_active; then enable_dns; fi
-                else
-                    echo -e "${C_RED}✗ Не удалось загрузить адреса.${C_RESET}"
-                fi
-                sleep 2
+                menu_autostart
                 ;;
             6)
-                self_update
+                clear
+                echo -e "${C_CYAN}--> Проверка актуальности серверов онлайн...${C_RESET}"
+                if check_for_ip_updates "true"; then
+                    :
+                else
+                    echo -e "${C_GREEN}✓ Все списки серверов актуальны. Обновление не требуется.${C_RESET}"
+                    sleep 1.5
+                fi
                 ;;
             7)
-                menu_custom_dns
+                upgrade_self
                 ;;
             8)
-                clear
-                show_status
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+                show_status "true"
                 ;;
             9)
-                echo -e "${C_YELLOW}Сброс настроек DNS-AI и восстановление дефолтной сети...${C_RESET}"
                 disable_dns
-                manage_autostart disable 2>/dev/null || true
-                rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
-                echo -e "${C_GREEN}✓ Все настройки сброшены.${C_RESET}"
-                sleep 2
+                rm -rf "$CACHE_DIR"
+                echo -e "${C_YELLOW}✓ Все настройки и кэш сброшены.${C_RESET}"
+                sleep 1.5
                 ;;
-            0|"q"|"Q")
+            0|q|Q)
                 clear
                 exit 0
                 ;;
             *)
-                echo -e "${C_RED}Неверный ввод! Попробуйте снова.${C_RESET}"
-                sleep 1
+                echo -e "${C_RED}Неверный пункт меню!${C_RESET}"
+                sleep 0.8
                 ;;
         esac
     done
 }
 
-show_help() {
-    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║                  DNS-AI Management Console (CLI)                   ║${C_RESET}"
-    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
-    echo -e "${C_BOLD}Использование:${C_RESET} ${C_CYAN}dns-ai${C_RESET} [КОМАНДА] [ПАРАМЕТРЫ]"
-    echo ""
-    echo -e "Если запустить ${C_CYAN}dns-ai${C_RESET} без аргументов, откроется интерактивное TUI-меню."
-    echo ""
-    echo -e "${C_BOLD}Основные команды:${C_RESET}"
-    echo -e "  ${C_GREEN}on${C_RESET} [IP...]               Включить DNS-over-TLS и маршрутизацию нейросетей"
-    echo -e "                           (опционально можно передать свои IP адреса)"
-    echo -e "  ${C_RED}off${C_RESET}                      Выключить DNS-AI, восстановить системный DNS"
-    echo -e "  ${C_YELLOW}toggle${C_RESET}                   Быстро переключить состояние (Вкл / Выкл)"
-    echo -e "  ${C_CYAN}status${C_RESET}                   Показать текущее состояние DoT, resolved и hosts"
-    echo -e "  ${C_MAGENTA}test${C_RESET}                     Комплексная диагностика (DoT 853, SNI прокси, AI)"
-    echo ""
-    echo -e "${C_BOLD}Автозагрузка и узлы:${C_RESET}"
-    echo -e "  ${C_CYAN}autostart${C_RESET} <действие>     Управление службой автозагрузки systemd:"
-    echo -e "                             ${C_GREEN}enable${C_RESET}   — включить автозагрузку при старте ОС"
-    echo -e "                             ${C_YELLOW}disable${C_RESET}  — выключить автозагрузку"
-    echo -e "                             ${C_CYAN}status${C_RESET}   — проверить текущее состояние"
-    echo -e "                             ${C_MAGENTA}toggle${C_RESET}   — переключить состояние"
-    echo -e "  ${C_CYAN}set-sni${C_RESET} <режим|IP>       Настройка промежуточного узла Google AI:"
-    echo -e "                             ${C_GREEN}auto${C_RESET}     — автоматический выбор с проверкой TLS"
-    echo -e "                             ${C_CYAN}backup${C_RESET}   — резервный узел ($BACKUP_SNI_IP) [стабилен]"
-    echo -e "                             ${C_YELLOW}primary${C_RESET}  — официальный узел ($PRIMARY_SNI_IP)"
-    echo -e "                             ${C_RED}none${C_RESET}     — отключить оверрайд Google AI"
-    echo -e "                             ${C_WHITE}<IP>${C_RESET}     — использовать свой IP адрес"
-    echo -e "  ${C_CYAN}set-ip${C_RESET} <IP1> [IP2]       Указать пользовательские DNS-серверы"
-    echo -e "  ${C_CYAN}update${C_RESET}                   Обновить список серверов (endpoints.json)"
-    echo -e "  ${C_GREEN}upgrade${C_RESET}, ${C_GREEN}self-update${C_RESET}     Обновить саму программу из GitHub"
-    echo -e "  ${C_RED}reset${C_RESET}                    Полный сброс параметров сети до стандартных"
-    echo -e "  ${C_CYAN}tui${C_RESET}, ${C_CYAN}menu${C_RESET}                Принудительный запуск интерактивной консоли"
-    echo -e "  ${C_BLUE}-h${C_RESET}, ${C_BLUE}--help${C_RESET}, ${C_BLUE}help${C_RESET}         Показать эту справку и выйти"
-    echo ""
-    echo -e "${C_BOLD}Примеры:${C_RESET}"
-    echo -e "  ${C_CYAN}dns-ai${C_RESET}                   # Интерактивное TUI-меню"
-    echo -e "  ${C_CYAN}dns-ai on${C_RESET}                # Включение с официальными серверами"
-    echo -e "  ${C_CYAN}dns-ai test${C_RESET}              # Полный тест доступности DoT и прокси"
-    echo -e "  ${C_CYAN}dns-ai upgrade${C_RESET}           # Обновление программы из GitHub"
-    echo -e "  ${C_CYAN}dns-ai set-sni backup${C_RESET}    # Переключение Google AI на резервный узел"
-    echo -e "  ${C_CYAN}dns-ai autostart enable${C_RESET}  # Включение запуска при загрузке системы"
-    echo ""
-}
-
-# ----------------- CLI Command Routing -----------------
+# ----------------- CLI Argument Router -----------------
 case "$1" in
     on|enable|start)
-        shift
-        enable_dns "$@"
+        enable_dns "$2"
         ;;
     off|disable|stop)
         disable_dns
         ;;
     toggle)
-        shift
-        toggle_dns "$@"
+        toggle_dns
         ;;
-    update|refresh)
-        echo "--> Обновление кэша эндпоинтов DNS-AI..."
-        fetch_endpoints
-        if is_active; then
-            enable_dns
+    profile)
+        if [ -n "$2" ]; then
+            set_active_profile "$2"
+            if is_active; then enable_dns; else echo "✓ Профиль переключен на $(get_profile_name "$2")."; fi
         else
-            echo "✓ Кэш обновлен. Запустите 'dns-ai on' для активации."
+            echo "Использование: dns-ai profile {geohide-eu|geohide-us|geohide-ru|dns-ai}"
         fi
-        ;;
-    upgrade|self-update|update-app)
-        shift
-        self_update "$@"
-        ;;
-    test)
-        run_full_test
-        ;;
-    status)
-        show_status
-        ;;
-    autostart)
-        shift
-        manage_autostart "${1:-status}"
         ;;
     set-sni)
-        shift
-        if [ -n "$1" ]; then
-            echo "$1" > "$MODE_FILE"
-            echo "SNI mode set to: $1"
-            if is_active; then enable_dns; fi
+        if [ -n "$2" ]; then
+            set_sni_mode "$2"
+            if is_active; then enable_dns; else echo "✓ Режим SNI установлен: $2"; fi
         else
-            echo "Использование: dns-ai set-sni <auto|backup|primary|none|<ip>>"
+            echo "Использование: dns-ai set-sni {auto|geohide-eu|geohide-us|direct|primary|none|manual:<ip>}"
         fi
         ;;
-    set-ip)
-        shift
-        if [ -z "$1" ]; then
-            echo "Использование: dns-ai set-ip <ip1> [ip2]"
-            exit 1
+    test)
+        run_diagnostics "false"
+        ;;
+    status)
+        show_status "false"
+        ;;
+    check-ip)
+        echo -e "${C_CYAN}--> Проверка актуальности серверов онлайн...${C_RESET}"
+        if check_for_ip_updates "true"; then
+            :
+        else
+            echo -e "${C_GREEN}✓ Все списки серверов актуальны. Обновление не требуется.${C_RESET}"
         fi
-        enable_dns "$*"
+        ;;
+    update|refresh)
+        echo -e "${C_CYAN}--> Обновление базы адресов серверов...${C_RESET}"
+        fetch_dns_ai_endpoints >/dev/null 2>&1 || true
+        if is_active; then enable_dns; else echo "✓ Кэш адресов обновлен."; fi
+        ;;
+    upgrade)
+        upgrade_self
+        ;;
+    autostart)
+        manage_autostart "${2:-toggle}"
         ;;
     reset)
         disable_dns
-        manage_autostart disable 2>/dev/null || true
-        rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
-        echo "✓ Сброс завершен."
+        rm -rf "$CACHE_DIR"
+        echo "✓ Сброшено к заводским настройкам."
         ;;
     -h|--help|help)
-        show_help
-        ;;
-    tui|menu|"")
-        main_tui
+        echo "Использование: dns-ai [КОМАНДА]"
+        echo ""
+        echo "Команды CLI:"
+        echo "  dns-ai                           Запуск интерактивного меню (TUI)"
+        echo "  dns-ai on [профиль]             Включить шифрованный DNS (geohide-eu|geohide-us|geohide-ru|dns-ai)"
+        echo "  dns-ai off                       Выключить и вернуть стандартный DNS"
+        echo "  dns-ai toggle                    Переключить состояние (On/Off)"
+        echo "  dns-ai profile <имя>             Сменить активный профиль"
+        echo "  dns-ai test                      Запустить полную диагностику DoT и SNI"
+        echo "  dns-ai status                    Показать подробное состояние сети"
+        echo "  dns-ai check-ip                  Проверить обновление IP серверов онлайн"
+        echo "  dns-ai set-sni <режим>           Настроить SNI (auto|geohide-eu|geohide-us|direct|primary)"
+        echo "  dns-ai autostart {enable|disable} Управление автозагрузкой systemd"
+        echo "  dns-ai upgrade                   Обновить программу из GitHub"
+        echo "  dns-ai reset                     Сбросить все настройки к стандартным"
+        echo ""
         ;;
     *)
-        show_help
-        exit 1
+        main_tui "$@"
         ;;
 esac
