@@ -1,0 +1,743 @@
+#!/bin/bash
+# ==============================================================================
+#  DNS-AI Management Console & TUI
+#  Encrypted DNS-over-TLS & AI Services Reverse-Proxy Manager
+#  Author: Falmer-128 (https://github.com/Falmer-128/dns-ai-tui)
+# ==============================================================================
+
+set -o pipefail
+
+# ----------------- Configuration & Constants -----------------
+CONFIG_DIR="/etc/systemd/resolved.conf.d"
+CONFIG_FILE="$CONFIG_DIR/dns-ai.conf"
+HOSTS_FILE="/etc/hosts"
+CACHE_DIR="/etc/dns-ai"
+CACHE_FILE="$CACHE_DIR/endpoints.json"
+MODE_FILE="$CACHE_DIR/sni_mode"
+SERVICE_NAME="dns-ai.service"
+
+TLS_NAME="dns.dns-ai.ru"
+FALLBACK_V4="194.87.196.13 45.151.102.219"
+FALLBACK_V6="2a00:b700:5::3:62 2a12:5940:d4ef::219"
+
+PRIMARY_SNI_IP="109.120.131.200"
+BACKUP_SNI_IP="143.20.64.55"
+
+# Terminal Colors
+C_RESET="\e[0m"
+C_BOLD="\e[1m"
+C_CYAN="\e[1;36m"
+C_GREEN="\e[1;32m"
+C_YELLOW="\e[1;33m"
+C_RED="\e[1;31m"
+C_BLUE="\e[1;34m"
+C_MAGENTA="\e[1;35m"
+C_GRAY="\e[0;90m"
+C_WHITE="\e[1;37m"
+
+mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
+
+# ----------------- Privilege Escalation Helper -----------------
+ensure_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            exec sudo "$0" "$@"
+        elif command -v doas >/dev/null 2>&1; then
+            exec doas "$0" "$@"
+        else
+            echo -e "${C_RED}Ошибка:${C_RESET} Для выполнения этого действия требуются права root (sudo)."
+            exit 1
+        fi
+    fi
+}
+
+# ----------------- Core Network Functions -----------------
+fetch_endpoints() {
+    local data=""
+    data=$(curl -fsSL --max-time 5 https://dns-ai.ru/endpoints.json 2>/dev/null || \
+           curl -fsSL --max-time 5 https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json 2>/dev/null || true)
+    if [ -n "$data" ] && echo "$data" | grep -q '"v4"'; then
+        mkdir -p "$CACHE_DIR" 2>/dev/null || true
+        echo "$data" > "$CACHE_FILE" 2>/dev/null || true
+        echo "$data"
+        return 0
+    elif [ -f "$CACHE_FILE" ]; then
+        cat "$CACHE_FILE"
+        return 0
+    fi
+    return 1
+}
+
+get_current_ips() {
+    local v4="" v6=""
+    local json=""
+    json=$(fetch_endpoints 2>/dev/null || true)
+    if [ -n "$json" ]; then
+        v4=$(echo "$json" | sed -n 's/.*"v4":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 2 | tr '\n' ' ')
+        v6=$(echo "$json" | sed -n 's/.*"v6":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep ':' | head -n 2 | tr '\n' ' ')
+    fi
+
+    if [ -z "$v4" ]; then
+        v4="$FALLBACK_V4"
+        v6="$FALLBACK_V6"
+    fi
+    echo "$v4|$v6"
+}
+
+verify_sni_tls() {
+    local host="$1"
+    local ip="$2"
+    local timeout="${3:-2.5}"
+    python3 -c "
+import ssl, socket, sys
+try:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout($timeout)
+    s.connect(('$ip', 443))
+    ss = ctx.wrap_socket(s, server_hostname='$host')
+    ss.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+determine_sni_ip() {
+    local mode="auto"
+    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+
+    case "$mode" in
+        backup|143*)
+            echo "$BACKUP_SNI_IP"
+            return 0
+            ;;
+        primary|109*)
+            echo "$PRIMARY_SNI_IP"
+            return 0
+            ;;
+        none|disabled)
+            echo ""
+            return 0
+            ;;
+        manual:*)
+            echo "${mode#manual:}"
+            return 0
+            ;;
+        auto|*)
+            # Try dynamic resolved answer first
+            local sni=""
+            if command -v resolvectl &>/dev/null; then
+                sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
+            fi
+            if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]]; then
+                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 2.0; then
+                    echo "$sni"
+                    return 0
+                fi
+            fi
+            # Check backup node
+            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
+                echo "$BACKUP_SNI_IP"
+                return 0
+            fi
+            # Check primary node
+            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 2.0; then
+                echo "$PRIMARY_SNI_IP"
+                return 0
+            fi
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+update_hosts_entry() {
+    local sni_ip="$1"
+    sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
+
+    if [ -n "$sni_ip" ]; then
+        cat << HOSTS >> "$HOSTS_FILE"
+# BEGIN DNS-AI-HOSTS
+$sni_ip generativelanguage.googleapis.com
+$sni_ip daily-cloudcode-pa.googleapis.com
+$sni_ip cloudcode-pa.googleapis.com
+$sni_ip alkalimakersuite-pa.clients6.google.com
+$sni_ip aicode.googleapis.com
+$sni_ip businessaicode.googleapis.com
+$sni_ip aiplatform.googleapis.com
+# END DNS-AI-HOSTS
+HOSTS
+    fi
+}
+
+enable_dns() {
+    ensure_root "$@"
+    local custom_v4="$1"
+    local v4="" v6=""
+
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+    if [ -n "$custom_v4" ]; then
+        v4="$custom_v4"
+        v6=""
+        echo -e "${C_CYAN}--> [DNS-AI] Использование ручных IP:${C_RESET} $v4"
+    else
+        local ips
+        ips=$(get_current_ips)
+        v4=$(echo "$ips" | cut -d'|' -f1)
+        v6=$(echo "$ips" | cut -d'|' -f2)
+        echo -e "${C_CYAN}--> [DNS-AI] Официальные эндпоинты:${C_RESET} $v4"
+    fi
+
+    local dns_entries=""
+    local resolvectl_entries=""
+    for ip in $v4 $v6; do
+        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME" && resolvectl_entries="$resolvectl_entries $ip#$TLS_NAME"
+    done
+
+    cat << CONF > "$CONFIG_FILE"
+[Resolve]
+DNS=
+DNS=$dns_entries
+FallbackDNS=1.1.1.1 8.8.8.8
+DNSOverTLS=yes
+DNSSEC=no
+Domains=~.
+CONF
+
+    systemctl restart systemd-resolved 2>/dev/null || true
+
+    if command -v resolvectl &>/dev/null; then
+        for iface in $(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth'); do
+            resolvectl dns "$iface" $resolvectl_entries 2>/dev/null || true
+            resolvectl domain "$iface" "~." 2>/dev/null || true
+            resolvectl dnsovertls "$iface" yes 2>/dev/null || true
+            resolvectl dnssec "$iface" no 2>/dev/null || true
+        done
+        resolvectl flush-caches 2>/dev/null || true
+    fi
+
+    local sni_ip
+    sni_ip=$(determine_sni_ip)
+    if [ -n "$sni_ip" ]; then
+        update_hosts_entry "$sni_ip"
+        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
+        echo -e "${C_GREEN}✓ Google AI / Antigravity направлены на SNI-узел:${C_RESET} ${C_WHITE}$sni_ip${C_RESET}"
+    else
+        update_hosts_entry ""
+        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
+        echo -e "${C_YELLOW}⚠ Внимание: Ни один SNI-узел Google AI не ответил по TLS. Оверрайд /etc/hosts пропущен.${C_RESET}"
+    fi
+}
+
+disable_dns() {
+    ensure_root "$@"
+    rm -f "$CONFIG_FILE"
+    sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
+
+    systemctl restart systemd-resolved 2>/dev/null || true
+
+    if command -v resolvectl &>/dev/null; then
+        for iface in $(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth'); do
+            resolvectl revert "$iface" 2>/dev/null || true
+        done
+        resolvectl flush-caches 2>/dev/null || true
+    fi
+    echo -e "${C_YELLOW}✓ DNS-AI ВЫКЛЮЧЕН. Восстановлены стандартные настройки DNS и hosts.${C_RESET}"
+}
+
+toggle_dns() {
+    if is_active; then
+        disable_dns
+    else
+        enable_dns
+    fi
+}
+
+# ----------------- Status Helpers -----------------
+is_active() {
+    [ -f "$CONFIG_FILE" ] && return 0
+    return 1
+}
+
+is_autostart_enabled() {
+    systemctl is-enabled "$SERVICE_NAME" &>/dev/null && return 0
+    return 1
+}
+
+get_active_sni_in_hosts() {
+    if grep -q "BEGIN DNS-AI-HOSTS" "$HOSTS_FILE" 2>/dev/null; then
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*generativelanguage' "$HOSTS_FILE" 2>/dev/null | awk '{print $1}' | head -n 1
+    else
+        echo ""
+    fi
+}
+
+get_current_sni_mode_desc() {
+    local mode="auto"
+    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+    case "$mode" in
+        backup) echo "Принудительно резерв ($BACKUP_SNI_IP)" ;;
+        primary) echo "Принудительно основной ($PRIMARY_SNI_IP)" ;;
+        none|disabled) echo "Отключен" ;;
+        manual:*) echo "Ручной (${mode#manual:})" ;;
+        auto|*) echo "Автоматический выбор (с проверкой TLS)" ;;
+    esac
+}
+
+# ----------------- Autostart Management -----------------
+manage_autostart() {
+    ensure_root "$@"
+    local action="$1"
+
+    # Ensure systemd service exists in /etc/systemd/system
+    if [ ! -f "/etc/systemd/system/$SERVICE_NAME" ]; then
+        cat << SERVICE > "/etc/systemd/system/$SERVICE_NAME"
+[Unit]
+Description=DNS-AI Encrypted DNS and AI Services Routing
+Documentation=https://github.com/Falmer-128/dns-ai-tui
+After=network-online.target systemd-resolved.service
+Wants=network-online.target systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/dns-ai on
+ExecStop=/usr/local/bin/dns-ai off
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    case "$action" in
+        enable)
+            systemctl enable "$SERVICE_NAME" 2>/dev/null
+            systemctl daemon-reload 2>/dev/null || true
+            echo -e "${C_GREEN}✓ DNS-AI добавлен в автозагрузку (systemd)!${C_RESET}"
+            ;;
+        disable)
+            systemctl disable "$SERVICE_NAME" 2>/dev/null
+            systemctl daemon-reload 2>/dev/null || true
+            echo -e "${C_YELLOW}✓ DNS-AI удален из автозагрузки!${C_RESET}"
+            ;;
+        toggle)
+            if is_autostart_enabled; then
+                manage_autostart disable
+            else
+                manage_autostart enable
+            fi
+            ;;
+        status)
+            if is_autostart_enabled; then
+                echo -e "Автозагрузка: ${C_GREEN}ВКЛЮЧЕНА${C_RESET}"
+            else
+                echo -e "Автозагрузка: ${C_YELLOW}ОТКЛЮЧЕНА${C_RESET}"
+            fi
+            ;;
+    esac
+}
+
+# ----------------- Diagnostic Test -----------------
+run_full_test() {
+    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║                Комплексная диагностика DNS-AI                      ║${C_RESET}"
+    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+
+    python3 -c "
+import socket, ssl, time, json, urllib.request
+
+print('\033[1;36m[1] Проверка официального списка endpoints.json:\033[0m')
+data = None
+for url in ['https://dns-ai.ru/endpoints.json', 'https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json']:
+    try:
+        t0 = time.time()
+        req = urllib.request.urlopen(url, timeout=4)
+        data = json.loads(req.read().decode('utf-8'))
+        dt = (time.time() - t0) * 1000
+        print(f'    \033[1;32m✓\033[0m {url} \033[0;90m({dt:.0f}ms, Serial {data.get(\"serial\", \"?\")})\033[0m')
+        break
+    except Exception as e:
+        print(f'    \033[1;31m✗\033[0m {url} \033[0;90m({e})\033[0m')
+
+v4_list = data.get('v4', ['186.246.49.127', '194.87.196.13']) if data else ['186.246.49.127', '194.87.196.13']
+retired = data.get('retired', []) if data else []
+
+print('\n\033[1;36m[2] Проверка серверов DNS-over-TLS (Порт 853):\033[0m')
+for ip in v4_list:
+    t0 = time.time()
+    try:
+        s = socket.create_connection((ip, 853), timeout=3)
+        ctx = ssl.create_default_context()
+        ss = ctx.wrap_socket(s, server_hostname='dns.dns-ai.ru')
+        dt = (time.time() - t0) * 1000
+        ss.close()
+        print(f'    \033[1;32m✓\033[0m {ip}:853 DoT доступен \033[0;90m({dt:.1f}ms)\033[0m')
+    except Exception as e:
+        print(f'    \033[1;31m✗\033[0m {ip}:853 DoT ОШИБКА \033[0;90m({e})\033[0m')
+
+for ip in retired:
+    print(f'    \033[0;90mℹ {ip} — выведен из эксплуатации (retired upstream)\033[0m')
+
+print('\n\033[1;36m[3] Проверка промежуточных SNI-прокси для ИИ (Порт 443 TLS):\033[0m')
+def test_sni(host, ip, timeout=3):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    t0 = time.time()
+    try:
+        s.connect((ip, 443))
+        ss = ctx.wrap_socket(s, server_hostname=host)
+        dt = (time.time() - t0) * 1000
+        ss.close()
+        return True, f'OK ({dt:.1f}ms)'
+    except Exception as e:
+        return False, f'FAIL ({e})'
+
+targets = [
+    ('ChatGPT', 'chatgpt.com', '62.60.230.61'),
+    ('OpenAI API', 'api.openai.com', '62.60.230.61'),
+    ('Claude AI', 'claude.ai', '62.60.230.61'),
+    ('Google AI Primary', 'generativelanguage.googleapis.com', '109.120.131.200'),
+    ('Google AI Backup', 'generativelanguage.googleapis.com', '143.20.64.55'),
+]
+
+for label, host, ip in targets:
+    ok, res = test_sni(host, ip)
+    icon = '\033[1;32m✓\033[0m' if ok else '\033[1;31m✗\033[0m'
+    status_color = '\033[0;32m' if ok else '\033[0;31m'
+    print(f'    {icon} {label:<20} [{ip}]: {status_color}{res}\033[0m')
+
+print('\n\033[1;36m[4] Текущая локальная резолюция в системе:\033[0m')
+try:
+    infos = socket.getaddrinfo('generativelanguage.googleapis.com', 443)
+    ips = list(set([item[4][0] for item in infos]))
+    print(f'    generativelanguage.googleapis.com -> \033[1;37m{ips[:3]}\033[0m')
+except Exception as e:
+    print(f'    \033[1;31m✗ Ошибка резолва: {e}\033[0m')
+"
+    echo -e "${C_CYAN}════════════════════════════════════════════════════════════════════${C_RESET}"
+}
+
+show_status() {
+    echo -e "${C_CYAN}--- Глобальная конфигурация systemd-resolved ---${C_RESET}"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "Статус: ${C_GREEN}[ АКТИВЕН ]${C_RESET}"
+        cat "$CONFIG_FILE"
+    else
+        echo -e "Статус: ${C_YELLOW}[ ВЫКЛЮЧЕН ]${C_RESET}"
+    fi
+    echo ""
+    echo -e "${C_CYAN}--- Перенаправления в /etc/hosts ---${C_RESET}"
+    if grep -q "BEGIN DNS-AI-HOSTS" "$HOSTS_FILE" 2>/dev/null; then
+        sed -n '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/p' "$HOSTS_FILE"
+    else
+        echo "Записи DNS-AI в /etc/hosts отсутствуют."
+    fi
+    echo ""
+    echo -e "${C_CYAN}--- Активное состояние resolved ---${C_RESET}"
+    resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers|DNSOverTLS|Link " | head -n 12 || true
+}
+
+# ----------------- TUI Submenus -----------------
+menu_sni_settings() {
+    while true; do
+        clear
+        echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
+        echo -e "${C_CYAN}║         Настройка Google AI SNI узла             ║${C_RESET}"
+        echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
+        echo -e "  Текущий режим:  ${C_WHITE}$(get_current_sni_mode_desc)${C_RESET}"
+        local active_ip
+        active_ip=$(get_active_sni_in_hosts)
+        if [ -n "$active_ip" ]; then
+            echo -e "  Активен в hosts: ${C_GREEN}$active_ip${C_RESET}"
+        else
+            echo -e "  Активен в hosts: ${C_YELLOW}нет оверрайда${C_RESET}"
+        fi
+        echo ""
+        echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
+        echo -e "  ${C_GREEN}1)${C_RESET} Автоматический выбор (проверка TLS при старте) [Рекомендуется]"
+        echo -e "  ${C_CYAN}2)${C_RESET} Принудительно резервный узел ($BACKUP_SNI_IP) [Проверен и стабилен]"
+        echo -e "  ${C_YELLOW}3)${C_RESET} Принудительно основной узел ($PRIMARY_SNI_IP)"
+        echo -e "  ${C_MAGENTA}4)${C_RESET} Указать свой IP вручную"
+        echo -e "  ${C_RED}5)${C_RESET} Отключить оверрайд Google AI"
+        echo ""
+        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-5]: ${C_RESET}")" sni_choice
+        case "$sni_choice" in
+            1)
+                ensure_root
+                echo "auto" > "$MODE_FILE"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен автоматический режим!${C_RESET}"
+                sleep 1.5
+                ;;
+            2)
+                ensure_root
+                echo "backup" > "$MODE_FILE"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен резервный узел ($BACKUP_SNI_IP)!${C_RESET}"
+                sleep 1.5
+                ;;
+            3)
+                ensure_root
+                echo "primary" > "$MODE_FILE"
+                if is_active; then enable_dns; fi
+                echo -e "${C_GREEN}✓ Установлен основной узел ($PRIMARY_SNI_IP)!${C_RESET}"
+                sleep 1.5
+                ;;
+            4)
+                ensure_root
+                read -p "Введите IP адрес SNI прокси: " manual_ip
+                if [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "manual:$manual_ip" > "$MODE_FILE"
+                    if is_active; then enable_dns; fi
+                    echo -e "${C_GREEN}✓ Установлен пользовательский узел ($manual_ip)!${C_RESET}"
+                else
+                    echo -e "${C_RED}Некорректный IP адрес!${C_RESET}"
+                fi
+                sleep 2
+                ;;
+            5)
+                ensure_root
+                echo "none" > "$MODE_FILE"
+                update_hosts_entry ""
+                echo -e "${C_YELLOW}✓ Оверрайд Google AI отключен!${C_RESET}"
+                sleep 1.5
+                ;;
+            0|"")
+                break
+                ;;
+            *)
+                echo -e "${C_RED}Неверный выбор!${C_RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+menu_custom_dns() {
+    clear
+    echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║         Выбор пользовательских DNS серверов      ║${C_RESET}"
+    echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
+    echo "Введите один или два IPv4 адреса через пробел (или Enter для отмены):"
+    read -p "DNS IP: " custom_input
+    if [ -n "$custom_input" ]; then
+        ensure_root
+        enable_dns "$custom_input"
+        read -p "$(echo -e "${C_CYAN}Нажмите Enter для продолжения...${C_RESET}")"
+    fi
+}
+
+menu_autostart() {
+    while true; do
+        clear
+        echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
+        echo -e "${C_CYAN}║          Управление автозагрузкой (Systemd)      ║${C_RESET}"
+        echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
+        if is_autostart_enabled; then
+            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (systemd enabled)${C_RESET}"
+        else
+            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА (systemd disabled)${C_RESET}"
+        fi
+        echo ""
+        echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
+        echo -e "  ${C_GREEN}1)${C_RESET} $( is_autostart_enabled && echo "Убрать из автозагрузки" || echo "Добавить в автозагрузку" )"
+        echo -e "  ${C_CYAN}2)${C_RESET} Проверить статус службы (systemctl status)"
+        echo ""
+        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-2]: ${C_RESET}")" auto_choice
+        case "$auto_choice" in
+            1)
+                manage_autostart toggle
+                sleep 1.5
+                ;;
+            2)
+                systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
+                echo ""
+                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+                ;;
+            0|"")
+                break
+                ;;
+            *)
+                echo -e "${C_RED}Неверный выбор!${C_RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ----------------- Main TUI Menu Loop -----------------
+main_tui() {
+    trap "clear; exit 0" SIGINT SIGTERM
+    while true; do
+        clear
+        echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+        echo -e "${C_CYAN}║                  DNS-AI Management Console                         ║${C_RESET}"
+        echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+
+        # Status block
+        if is_active; then
+            echo -e "  Служба DNS-AI:  ${C_GREEN}● РАБОТАЕТ (DoT $TLS_NAME активен)${C_RESET}"
+        else
+            echo -e "  Служба DNS-AI:  ${C_RED}○ ВЫКЛЮЧЕН (используется системный DNS)${C_RESET}"
+        fi
+
+        if is_autostart_enabled; then
+            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (systemd service enabled)${C_RESET}"
+        else
+            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА${C_RESET}"
+        fi
+
+        local active_sni
+        active_sni=$(get_active_sni_in_hosts)
+        if [ -n "$active_sni" ]; then
+            echo -e "  Google AI SNI:  ${C_WHITE}$active_sni${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
+        else
+            echo -e "  Google AI SNI:  ${C_YELLOW}без оверрайда${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
+        fi
+
+        echo -e "  Защита сбоев:   ${C_GRAY}FallbackDNS=1.1.1.1 8.8.8.8${C_RESET}"
+        echo ""
+        echo -e "  ${C_BLUE}0)${C_RESET} ${C_BOLD}Выйти${C_RESET}"
+        echo -e "  ${C_GREEN}1)${C_RESET} $( is_active && echo -e "${C_RED}Выключить DNS-AI${C_RESET}" || echo -e "${C_GREEN}Включить DNS-AI${C_RESET}" )"
+        echo -e "  ${C_CYAN}2)${C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)"
+        echo -e "  ${C_MAGENTA}3)${C_RESET} Управление автозагрузкой (Systemd)"
+        echo -e "  ${C_YELLOW}4)${C_RESET} Настройка Google AI SNI узла"
+        echo -e "  ${C_CYAN}5)${C_RESET} Обновить список адресов (endpoints.json)"
+        echo -e "  ${C_WHITE}6)${C_RESET} Ручной ввод DNS IP"
+        echo -e "  ${C_GRAY}7)${C_RESET} Подробная системная сводка (resolvectl)"
+        echo -e "  ${C_RED}8)${C_RESET} Сбросить все настройки сети до стандартных"
+        echo ""
+        echo -e "  \033[0;90mРепозиторий проекта: https://github.com/Falmer-128/dns-ai-tui\033[0m"
+        echo ""
+
+        read -p "$(echo -e "${C_CYAN}Выберите действие [0-8]: ${C_RESET}")" CHOICE
+        case "$CHOICE" in
+            1)
+                toggle_dns
+                sleep 1.2
+                ;;
+            2)
+                clear
+                run_full_test
+                echo ""
+                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+                ;;
+            3)
+                menu_autostart
+                ;;
+            4)
+                menu_sni_settings
+                ;;
+            5)
+                echo -e "${C_CYAN}--> Загрузка актуальных адресов с dns-ai.ru...${C_RESET}"
+                if fetch_endpoints >/dev/null; then
+                    echo -e "${C_GREEN}✓ Кэш адресов успешно обновлен!${C_RESET}"
+                    if is_active; then enable_dns; fi
+                else
+                    echo -e "${C_RED}✗ Не удалось загрузить адреса.${C_RESET}"
+                fi
+                sleep 2
+                ;;
+            6)
+                menu_custom_dns
+                ;;
+            7)
+                clear
+                show_status
+                echo ""
+                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
+                ;;
+            8)
+                echo -e "${C_YELLOW}Сброс настроек DNS-AI и восстановление дефолтной сети...${C_RESET}"
+                disable_dns
+                manage_autostart disable 2>/dev/null || true
+                rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
+                echo -e "${C_GREEN}✓ Все настройки сброшены.${C_RESET}"
+                sleep 2
+                ;;
+            0|"q"|"Q")
+                clear
+                exit 0
+                ;;
+            *)
+                echo -e "${C_RED}Неверный ввод! Попробуйте снова.${C_RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ----------------- CLI Command Routing -----------------
+case "$1" in
+    on|enable|start)
+        shift
+        enable_dns "$@"
+        ;;
+    off|disable|stop)
+        disable_dns
+        ;;
+    toggle)
+        shift
+        toggle_dns "$@"
+        ;;
+    update|refresh)
+        echo "--> Обновление кэша эндпоинтов DNS-AI..."
+        fetch_endpoints
+        if is_active; then
+            enable_dns
+        else
+            echo "✓ Кэш обновлен. Запустите 'dns-ai on' для активации."
+        fi
+        ;;
+    test)
+        run_full_test
+        ;;
+    status)
+        show_status
+        ;;
+    autostart)
+        shift
+        manage_autostart "${1:-status}"
+        ;;
+    set-sni)
+        shift
+        ensure_root
+        if [ -n "$1" ]; then
+            echo "$1" > "$MODE_FILE"
+            echo "SNI mode set to: $1"
+            if is_active; then enable_dns; fi
+        else
+            echo "Использование: dns-ai set-sni <auto|backup|primary|none|<ip>>"
+        fi
+        ;;
+    set-ip)
+        shift
+        ensure_root
+        if [ -z "$1" ]; then
+            echo "Использование: dns-ai set-ip <ip1> [ip2]"
+            exit 1
+        fi
+        enable_dns "$*"
+        ;;
+    reset)
+        disable_dns
+        manage_autostart disable 2>/dev/null || true
+        rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
+        echo "✓ Сброс завершен."
+        ;;
+    tui|menu|"")
+        main_tui
+        ;;
+    *)
+        echo "Использование: dns-ai [on|off|toggle|status|test|update|autostart|set-sni|set-ip|reset|tui]"
+        exit 1
+        ;;
+esac

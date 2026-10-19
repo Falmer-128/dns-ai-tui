@@ -1,0 +1,14 @@
+[Unit]
+Description=DNS-AI Encrypted DNS and AI Services Routing
+Documentation=https://github.com/Falmer-128/dns-ai-tui
+After=network-online.target systemd-resolved.service
+Wants=network-online.target systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/dns-ai on
+ExecStop=/usr/local/bin/dns-ai off
+
+[Install]
+WantedBy=multi-user.target
