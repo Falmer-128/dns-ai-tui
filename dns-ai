@@ -7,6 +7,26 @@
 
 set -o pipefail
 
+# ----------------- Privilege Escalation -----------------
+# Commands like 'test' and 'status' can run without root.
+# Interactive TUI and modifying commands require root privileges.
+case "$1" in
+    test|status)
+        ;;
+    *)
+        if [ "$(id -u)" -ne 0 ]; then
+            if command -v sudo >/dev/null 2>&1; then
+                exec sudo "$0" "$@"
+            elif command -v doas >/dev/null 2>&1; then
+                exec doas "$0" "$@"
+            else
+                echo -e "\e[1;31mОшибка:\e[0m Для выполнения этого действия требуются права root (sudo)."
+                exit 1
+            fi
+        fi
+        ;;
+esac
+
 # ----------------- Configuration & Constants -----------------
 CONFIG_DIR="/etc/systemd/resolved.conf.d"
 CONFIG_FILE="$CONFIG_DIR/dns-ai.conf"
@@ -36,20 +56,6 @@ C_GRAY="\e[0;90m"
 C_WHITE="\e[1;37m"
 
 mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
-
-# ----------------- Privilege Escalation Helper -----------------
-ensure_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        if command -v sudo >/dev/null 2>&1; then
-            exec sudo "$0" "$@"
-        elif command -v doas >/dev/null 2>&1; then
-            exec doas "$0" "$@"
-        else
-            echo -e "${C_RED}Ошибка:${C_RESET} Для выполнения этого действия требуются права root (sudo)."
-            exit 1
-        fi
-    fi
-}
 
 # ----------------- Core Network Functions -----------------
 fetch_endpoints() {
@@ -127,7 +133,6 @@ determine_sni_ip() {
             return 0
             ;;
         auto|*)
-            # Try dynamic resolved answer first
             local sni=""
             if command -v resolvectl &>/dev/null; then
                 sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
@@ -138,12 +143,10 @@ determine_sni_ip() {
                     return 0
                 fi
             fi
-            # Check backup node
             if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
                 echo "$BACKUP_SNI_IP"
                 return 0
             fi
-            # Check primary node
             if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 2.0; then
                 echo "$PRIMARY_SNI_IP"
                 return 0
@@ -174,7 +177,6 @@ HOSTS
 }
 
 enable_dns() {
-    ensure_root "$@"
     local custom_v4="$1"
     local v4="" v6=""
 
@@ -234,7 +236,6 @@ CONF
 }
 
 disable_dns() {
-    ensure_root "$@"
     rm -f "$CONFIG_FILE"
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
 
@@ -264,8 +265,7 @@ is_active() {
 }
 
 is_autostart_enabled() {
-    systemctl is-enabled "$SERVICE_NAME" &>/dev/null && return 0
-    return 1
+    [ "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)" = "enabled" ]
 }
 
 get_active_sni_in_hosts() {
@@ -290,7 +290,6 @@ get_current_sni_mode_desc() {
 
 # ----------------- Autostart Management -----------------
 manage_autostart() {
-    ensure_root "$@"
     local action="$1"
 
     # Ensure systemd service exists in /etc/systemd/system
@@ -318,12 +317,12 @@ SERVICE
         enable)
             systemctl enable "$SERVICE_NAME" 2>/dev/null
             systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_GREEN}✓ DNS-AI добавлен в автозагрузку (systemd)!${C_RESET}"
+            echo -e "${C_GREEN}✓ Служба $SERVICE_NAME успешно добавлена в автозагрузку!${C_RESET}"
             ;;
         disable)
             systemctl disable "$SERVICE_NAME" 2>/dev/null
             systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_YELLOW}✓ DNS-AI удален из автозагрузки!${C_RESET}"
+            echo -e "${C_YELLOW}✓ Служба $SERVICE_NAME успешно убрана из автозагрузки!${C_RESET}"
             ;;
         toggle)
             if is_autostart_enabled; then
@@ -334,9 +333,9 @@ SERVICE
             ;;
         status)
             if is_autostart_enabled; then
-                echo -e "Автозагрузка: ${C_GREEN}ВКЛЮЧЕНА${C_RESET}"
+                echo -e "Автозагрузка: ${C_GREEN}ВКЛЮЧЕНА (systemd enabled)${C_RESET}"
             else
-                echo -e "Автозагрузка: ${C_YELLOW}ОТКЛЮЧЕНА${C_RESET}"
+                echo -e "Автозагрузка: ${C_YELLOW}ОТКЛЮЧЕНА (systemd disabled)${C_RESET}"
             fi
             ;;
     esac
@@ -364,7 +363,7 @@ for url in ['https://dns-ai.ru/endpoints.json', 'https://raw.githubusercontent.c
     except Exception as e:
         print(f'    \033[1;31m✗\033[0m {url} \033[0;90m({e})\033[0m')
 
-v4_list = data.get('v4', ['186.246.49.127', '194.87.196.13']) if data else ['186.246.49.127', '194.87.196.13']
+v4_list = data.get('v4', ['194.87.196.13', '45.151.102.219']) if data else ['194.87.196.13', '45.151.102.219']
 retired = data.get('retired', []) if data else []
 
 print('\n\033[1;36m[2] Проверка серверов DNS-over-TLS (Порт 853):\033[0m')
@@ -471,28 +470,24 @@ menu_sni_settings() {
         read -p "$(echo -e "${C_CYAN}Выберите пункт [0-5]: ${C_RESET}")" sni_choice
         case "$sni_choice" in
             1)
-                ensure_root
                 echo "auto" > "$MODE_FILE"
                 if is_active; then enable_dns; fi
                 echo -e "${C_GREEN}✓ Установлен автоматический режим!${C_RESET}"
                 sleep 1.5
                 ;;
             2)
-                ensure_root
                 echo "backup" > "$MODE_FILE"
                 if is_active; then enable_dns; fi
                 echo -e "${C_GREEN}✓ Установлен резервный узел ($BACKUP_SNI_IP)!${C_RESET}"
                 sleep 1.5
                 ;;
             3)
-                ensure_root
                 echo "primary" > "$MODE_FILE"
                 if is_active; then enable_dns; fi
                 echo -e "${C_GREEN}✓ Установлен основной узел ($PRIMARY_SNI_IP)!${C_RESET}"
                 sleep 1.5
                 ;;
             4)
-                ensure_root
                 read -p "Введите IP адрес SNI прокси: " manual_ip
                 if [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                     echo "manual:$manual_ip" > "$MODE_FILE"
@@ -504,7 +499,6 @@ menu_sni_settings() {
                 sleep 2
                 ;;
             5)
-                ensure_root
                 echo "none" > "$MODE_FILE"
                 update_hosts_entry ""
                 echo -e "${C_YELLOW}✓ Оверрайд Google AI отключен!${C_RESET}"
@@ -529,7 +523,6 @@ menu_custom_dns() {
     echo "Введите один или два IPv4 адреса через пробел (или Enter для отмены):"
     read -p "DNS IP: " custom_input
     if [ -n "$custom_input" ]; then
-        ensure_root
         enable_dns "$custom_input"
         read -p "$(echo -e "${C_CYAN}Нажмите Enter для продолжения...${C_RESET}")"
     fi
@@ -542,13 +535,17 @@ menu_autostart() {
         echo -e "${C_CYAN}║          Управление автозагрузкой (Systemd)      ║${C_RESET}"
         echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
         if is_autostart_enabled; then
-            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (systemd enabled)${C_RESET}"
+            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (служба запустится при старте ОС)${C_RESET}"
         else
-            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА (systemd disabled)${C_RESET}"
+            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА (служба не в автозагрузке)${C_RESET}"
         fi
         echo ""
         echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
-        echo -e "  ${C_GREEN}1)${C_RESET} $( is_autostart_enabled && echo "Убрать из автозагрузки" || echo "Добавить в автозагрузку" )"
+        if is_autostart_enabled; then
+            echo -e "  ${C_RED}1)${C_RESET} Убрать из автозагрузки (systemctl disable)"
+        else
+            echo -e "  ${C_GREEN}1)${C_RESET} Добавить в автозагрузку (systemctl enable)"
+        fi
         echo -e "  ${C_CYAN}2)${C_RESET} Проверить статус службы (systemctl status)"
         echo ""
         read -p "$(echo -e "${C_CYAN}Выберите пункт [0-2]: ${C_RESET}")" auto_choice
@@ -558,6 +555,7 @@ menu_autostart() {
                 sleep 1.5
                 ;;
             2)
+                clear
                 systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
                 echo ""
                 read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
@@ -709,7 +707,6 @@ case "$1" in
         ;;
     set-sni)
         shift
-        ensure_root
         if [ -n "$1" ]; then
             echo "$1" > "$MODE_FILE"
             echo "SNI mode set to: $1"
@@ -720,7 +717,6 @@ case "$1" in
         ;;
     set-ip)
         shift
-        ensure_root
         if [ -z "$1" ]; then
             echo "Использование: dns-ai set-ip <ip1> [ip2]"
             exit 1
