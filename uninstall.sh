@@ -28,6 +28,16 @@ systemctl disable --now dns-ai.service 2>/dev/null || true
 rm -f /etc/systemd/system/dns-ai.service
 systemctl daemon-reload
 
+echo -e "${C_YELLOW}--> Удаление интеграции с NetworkManager...${C_RESET}"
+rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+systemctl reload NetworkManager 2>/dev/null || true
+
+if [ -f /etc/resolv.conf.dns-ai.bak ]; then
+    echo -e "${C_YELLOW}--> Восстановление резервной копии /etc/resolv.conf...${C_RESET}"
+    rm -f /etc/resolv.conf
+    mv -f /etc/resolv.conf.dns-ai.bak /etc/resolv.conf
+fi
+
 echo -e "${C_YELLOW}--> Удаление бинарных файлов и кэша...${C_RESET}"
 rm -f /usr/local/bin/dns-ai /usr/local/bin/dns-ai-tui
 rm -rf /etc/dns-ai

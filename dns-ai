@@ -180,7 +180,19 @@ enable_dns() {
     local custom_v4="$1"
     local v4="" v6=""
 
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+    # Ensure systemd-resolved is active
+    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl enable --now systemd-resolved 2>/dev/null || true
+    fi
+
+    # Ensure /etc/resolv.conf points to systemd-resolved stub
+    if [ -d /run/systemd/resolve ] || [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+        if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf 2>/dev/null)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
+            [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
+            rm -f /etc/resolv.conf
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        fi
+    fi
 
     if [ -n "$custom_v4" ]; then
         v4="$custom_v4"

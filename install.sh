@@ -30,19 +30,67 @@ fi
 # Detect directory of installer
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Check requirements
-echo -e "${C_CYAN}--> Проверка системных зависимостей...${C_RESET}"
-for dep in curl python3 systemctl; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
-        echo -e "${C_RED}Ошибка: Не найдена необходимая утилита: $dep${C_RESET}"
-        exit 1
-    fi
-done
+# Check and install requirements for Debian, Ubuntu, Fedora, Arch, etc.
+install_dependencies() {
+    echo -e "${C_CYAN}--> Проверка системных зависимостей...${C_RESET}"
 
-# Ensure systemd-resolved is installed
-if ! command -v resolvectl >/dev/null 2>&1 && ! [ -d /run/systemd/resolve ]; then
-    echo -e "${C_YELLOW}Предупреждение: systemd-resolved не обнаружен. Рекомендуется установить его.${C_RESET}"
-fi
+    local pkgs=()
+    command -v curl >/dev/null 2>&1 || pkgs+=("curl")
+    command -v python3 >/dev/null 2>&1 || pkgs+=("python3")
+
+    # In Debian 12 / Ubuntu, systemd-resolved is often not installed by default
+    if ! command -v resolvectl >/dev/null 2>&1 && ! systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then
+        pkgs+=("systemd-resolved")
+    fi
+
+    if [ ${#pkgs[@]} -gt 0 ]; then
+        echo -e "${C_YELLOW}--> Обнаружены недостающие пакеты: ${pkgs[*]}${C_RESET}"
+        echo -e "${C_CYAN}--> Автоматическая установка через пакетный менеджер...${C_RESET}"
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y
+            apt-get install -y "${pkgs[@]}"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "${pkgs[@]}"
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm --needed "${pkgs[@]}"
+        elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive install "${pkgs[@]}"
+        elif command -v apk >/dev/null 2>&1; then
+            apk add "${pkgs[@]}"
+        else
+            echo -e "${C_RED}Не удалось определить пакетный менеджер. Установите вручную: ${pkgs[*]}${C_RESET}"
+            exit 1
+        fi
+    fi
+
+    # Activate systemd-resolved
+    if systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then
+        echo -e "${C_CYAN}--> Активация службы systemd-resolved...${C_RESET}"
+        systemctl enable --now systemd-resolved 2>/dev/null || true
+    fi
+
+    # Configure NetworkManager to cooperate with systemd-resolved (Debian / Ubuntu / Fedora)
+    if systemctl is-active --quiet NetworkManager 2>/dev/null && [ -d /etc/NetworkManager/conf.d ]; then
+        echo -e "${C_CYAN}--> Интеграция NetworkManager с systemd-resolved...${C_RESET}"
+        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+[main]
+dns=systemd-resolved
+NM_CONF
+        systemctl reload NetworkManager 2>/dev/null || true
+    fi
+
+    # Ensure /etc/resolv.conf points to systemd-resolved stub
+    if [ -d /run/systemd/resolve ] || [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+        if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf 2>/dev/null)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
+            echo -e "${C_CYAN}--> Привязка /etc/resolv.conf к stub-resolv.conf...${C_RESET}"
+            [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
+            rm -f /etc/resolv.conf
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        fi
+    fi
+}
+
+install_dependencies
 
 # Copy binary
 echo -e "${C_CYAN}--> Установка исполняемого файла /usr/local/bin/dns-ai...${C_RESET}"
