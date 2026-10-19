@@ -88,6 +88,7 @@ dns-ai-tui
 | `dns-ai test` | Запустить полную диагностику DoT и SNI серверов |
 | `dns-ai status` | Показать текущее состояние resolved и hosts |
 | `dns-ai update` | Обновить базу актуальных серверов с dns-ai.ru |
+| `dns-ai upgrade` | Обновить саму программу до последней версии из GitHub |
 | `dns-ai autostart enable` | Добавить службу в автозагрузку systemd |
 | `dns-ai autostart disable` | Убрать службу из автозагрузки systemd |
 | `dns-ai set-sni backup` | Принудительно направить Google AI на резервный узел |

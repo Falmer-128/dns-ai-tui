@@ -583,6 +583,69 @@ menu_autostart() {
     done
 }
 
+# ----------------- Self-Update from GitHub -----------------
+self_update() {
+    clear
+    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║              Обновление программы DNS-AI из GitHub                 ║${C_RESET}"
+    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+    echo -e "Проверка обновлений в репозитории: ${C_WHITE}https://github.com/Falmer-128/dns-ai-tui${C_RESET}"
+    echo ""
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/dns-ai-update.XXXXXX)
+
+    # 1. If running inside a git repository, pull latest changes
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    if [ -d "$script_dir/.git" ] && command -v git >/dev/null 2>&1; then
+        echo -e "${C_CYAN}--> Обнаружен Git-репозиторий в $script_dir...${C_RESET}"
+        git -C "$script_dir" pull origin main 2>&1 || git -C "$script_dir" pull 2>&1 || true
+    fi
+
+    # 2. Download latest binary from GitHub
+    echo -e "${C_CYAN}--> Загрузка актуальной версии dns-ai с GitHub...${C_RESET}"
+    if ! curl -fsSL --max-time 15 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai" -o "$tmp_dir/dns-ai"; then
+        echo -e "${C_RED}✗ Ошибка: Не удалось скачать файл обновления. Проверьте сеть.${C_RESET}"
+        rm -rf "$tmp_dir"
+        echo ""
+        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+        return 1
+    fi
+
+    # 3. Syntax check
+    if ! bash -n "$tmp_dir/dns-ai" 2>/dev/null; then
+        echo -e "${C_RED}✗ Ошибка: Загруженный скрипт поврежден (синтаксическая ошибка). Обновление отменено.${C_RESET}"
+        rm -rf "$tmp_dir"
+        echo ""
+        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+        return 1
+    fi
+
+    # 4. Download latest systemd service
+    curl -fsSL --max-time 10 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai.service" -o "$tmp_dir/dns-ai.service" 2>/dev/null || true
+
+    # 5. Install binary
+    echo -e "${C_CYAN}--> Применение обновления...${C_RESET}"
+    mkdir -p /usr/local/bin
+    cp -f "$tmp_dir/dns-ai" /usr/local/bin/dns-ai
+    chmod 755 /usr/local/bin/dns-ai
+    ln -sf /usr/local/bin/dns-ai /usr/local/bin/dns-ai-tui
+
+    if [ -s "$tmp_dir/dns-ai.service" ]; then
+        cp -f "$tmp_dir/dns-ai.service" /etc/systemd/system/dns-ai.service
+        chmod 644 /etc/systemd/system/dns-ai.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    rm -rf "$tmp_dir"
+    echo ""
+    echo -e "${C_GREEN}✓ Программа успешно обновлена до актуальной версии из GitHub!${C_RESET}"
+    echo ""
+    read -p "$(echo -e "${C_CYAN}Нажмите Enter для перезапуска интерфейса...${C_RESET}")"
+    exec /usr/local/bin/dns-ai "$@"
+}
+
 # ----------------- Main TUI Menu Loop -----------------
 main_tui() {
     trap "clear; exit 0" SIGINT SIGTERM
@@ -620,15 +683,16 @@ main_tui() {
         echo -e "  ${C_CYAN}2)${C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)"
         echo -e "  ${C_MAGENTA}3)${C_RESET} Управление автозагрузкой (Systemd)"
         echo -e "  ${C_YELLOW}4)${C_RESET} Настройка Google AI SNI узла"
-        echo -e "  ${C_CYAN}5)${C_RESET} Обновить список адресов (endpoints.json)"
-        echo -e "  ${C_WHITE}6)${C_RESET} Ручной ввод DNS IP"
-        echo -e "  ${C_GRAY}7)${C_RESET} Подробная системная сводка (resolvectl)"
-        echo -e "  ${C_RED}8)${C_RESET} Сбросить все настройки сети до стандартных"
+        echo -e "  ${C_CYAN}5)${C_RESET} Обновить список адресов (endpoints.json с dns-ai.ru)"
+        echo -e "  ${C_GREEN}6)${C_RESET} Обновить программу из GitHub (Self-update)"
+        echo -e "  ${C_WHITE}7)${C_RESET} Ручной ввод DNS IP"
+        echo -e "  ${C_GRAY}8)${C_RESET} Подробная системная сводка (resolvectl)"
+        echo -e "  ${C_RED}9)${C_RESET} Сбросить все настройки сети до стандартных"
         echo ""
         echo -e "  \033[0;90mРепозиторий проекта: https://github.com/Falmer-128/dns-ai-tui\033[0m"
         echo ""
 
-        read -p "$(echo -e "${C_CYAN}Выберите действие [0-8]: ${C_RESET}")" CHOICE
+        read -p "$(echo -e "${C_CYAN}Выберите действие [0-9]: ${C_RESET}")" CHOICE
         case "$CHOICE" in
             1)
                 toggle_dns
@@ -657,15 +721,18 @@ main_tui() {
                 sleep 2
                 ;;
             6)
-                menu_custom_dns
+                self_update
                 ;;
             7)
+                menu_custom_dns
+                ;;
+            8)
                 clear
                 show_status
                 echo ""
                 read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
                 ;;
-            8)
+            9)
                 echo -e "${C_YELLOW}Сброс настроек DNS-AI и восстановление дефолтной сети...${C_RESET}"
                 disable_dns
                 manage_autostart disable 2>/dev/null || true
@@ -715,6 +782,7 @@ show_help() {
     echo -e "                             ${C_WHITE}<IP>${C_RESET}     — использовать свой IP адрес"
     echo -e "  ${C_CYAN}set-ip${C_RESET} <IP1> [IP2]       Указать пользовательские DNS-серверы"
     echo -e "  ${C_CYAN}update${C_RESET}                   Обновить список серверов (endpoints.json)"
+    echo -e "  ${C_GREEN}upgrade${C_RESET}, ${C_GREEN}self-update${C_RESET}     Обновить саму программу из GitHub"
     echo -e "  ${C_RED}reset${C_RESET}                    Полный сброс параметров сети до стандартных"
     echo -e "  ${C_CYAN}tui${C_RESET}, ${C_CYAN}menu${C_RESET}                Принудительный запуск интерактивной консоли"
     echo -e "  ${C_BLUE}-h${C_RESET}, ${C_BLUE}--help${C_RESET}, ${C_BLUE}help${C_RESET}         Показать эту справку и выйти"
@@ -723,6 +791,7 @@ show_help() {
     echo -e "  ${C_CYAN}dns-ai${C_RESET}                   # Интерактивное TUI-меню"
     echo -e "  ${C_CYAN}dns-ai on${C_RESET}                # Включение с официальными серверами"
     echo -e "  ${C_CYAN}dns-ai test${C_RESET}              # Полный тест доступности DoT и прокси"
+    echo -e "  ${C_CYAN}dns-ai upgrade${C_RESET}           # Обновление программы из GitHub"
     echo -e "  ${C_CYAN}dns-ai set-sni backup${C_RESET}    # Переключение Google AI на резервный узел"
     echo -e "  ${C_CYAN}dns-ai autostart enable${C_RESET}  # Включение запуска при загрузке системы"
     echo ""
@@ -749,6 +818,10 @@ case "$1" in
         else
             echo "✓ Кэш обновлен. Запустите 'dns-ai on' для активации."
         fi
+        ;;
+    upgrade|self-update|update-app)
+        shift
+        self_update "$@"
         ;;
     test)
         run_full_test
