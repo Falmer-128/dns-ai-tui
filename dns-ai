@@ -422,6 +422,7 @@ enable_dns() {
 # DNS-AI & GeoHide — systemd-resolved configuration
 # Generated on: $(date '+%Y-%m-%d %H:%M:%S')
 [Resolve]
+DNS=
 DNS=${dns_entries# }
 DNSOverTLS=yes
 Domains=~.
@@ -433,6 +434,17 @@ CONF
     nm_apply_ignore_dns
 
     systemctl restart systemd-resolved 2>/dev/null || true
+
+    # Clear per-interface DNS overrides so systemd-resolved uses Global DoT exclusively
+    for dev in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+        case "$dev" in
+            lo|docker*|br-*|veth*|dummy*) continue ;;
+        esac
+        resolvectl dns "$dev" "" 2>/dev/null || true
+        resolvectl domain "$dev" "" 2>/dev/null || true
+        resolvectl default-route "$dev" false 2>/dev/null || true
+    done
+
     resolvectl flush-caches 2>/dev/null || true
 
     # Resolve and inject AI SNI proxies
@@ -455,6 +467,13 @@ CONF
 disable_dns() {
     rm -f "$CONFIG_FILE"
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
+
+    for dev in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+        case "$dev" in
+            lo|docker*|br-*|veth*|dummy*) continue ;;
+        esac
+        resolvectl revert "$dev" 2>/dev/null || true
+    done
 
     nm_restore_dns
 
