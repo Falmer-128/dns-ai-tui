@@ -37,6 +37,9 @@ install_dependencies() {
     local pkgs=()
     command -v curl >/dev/null 2>&1 || pkgs+=("curl")
     command -v python3 >/dev/null 2>&1 || pkgs+=("python3")
+    if ! dpkg -s ca-certificates >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+        pkgs+=("ca-certificates")
+    fi
 
     # In Debian 12 / Ubuntu, systemd-resolved is often not installed by default
     if ! command -v resolvectl >/dev/null 2>&1 && ! systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then

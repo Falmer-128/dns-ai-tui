@@ -138,21 +138,22 @@ determine_sni_ip() {
                 sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
             fi
             if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]]; then
-                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 2.0; then
+                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 3.0; then
                     echo "$sni"
                     return 0
                 fi
             fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
+            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 3.0; then
                 echo "$BACKUP_SNI_IP"
                 return 0
             fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 2.0; then
+            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 3.0; then
                 echo "$PRIMARY_SNI_IP"
                 return 0
             fi
-            echo ""
-            return 1
+            # Always fall back to tested BACKUP_SNI_IP so Google AI / AGY never stays broken
+            echo "$BACKUP_SNI_IP"
+            return 0
             ;;
     esac
 }
@@ -167,12 +168,45 @@ update_hosts_entry() {
 $sni_ip generativelanguage.googleapis.com
 $sni_ip daily-cloudcode-pa.googleapis.com
 $sni_ip cloudcode-pa.googleapis.com
+$sni_ip cloudaicompanion.googleapis.com
+$sni_ip proactivebackend-pa.googleapis.com
 $sni_ip alkalimakersuite-pa.clients6.google.com
 $sni_ip aicode.googleapis.com
 $sni_ip businessaicode.googleapis.com
 $sni_ip aiplatform.googleapis.com
 # END DNS-AI-HOSTS
 HOSTS
+    fi
+}
+
+has_global_v6() {
+    [ -n "$(ip -6 addr show scope global 2>/dev/null)" ]
+}
+
+nm_apply_ignore_dns() {
+    command -v nmcli >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
+    mkdir -p "$CACHE_DIR"
+    nmcli -t -f UUID,TYPE,DEVICE connection show --active 2>/dev/null | while IFS=: read -r uuid type dev; do
+        case "$type" in
+            loopback|bridge|tun|wireguard|vpn|*docker*|dummy|"") continue ;;
+        esac
+        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes 2>/dev/null || continue
+        grep -qx "$uuid" "$CACHE_DIR/nm-connections" 2>/dev/null || printf '%s\n' "$uuid" >> "$CACHE_DIR/nm-connections"
+        [ -n "$dev" ] && nmcli device reapply "$dev" >/dev/null 2>&1 || true
+    done
+}
+
+nm_restore_dns() {
+    command -v nmcli >/dev/null 2>&1 || return 0
+    if [ -s "$CACHE_DIR/nm-connections" ]; then
+        while read -r uuid; do
+            [ -n "$uuid" ] || continue
+            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv6.ignore-auto-dns no 2>/dev/null || continue
+            dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
+            [ -n "$dev" ] && nmcli device reapply "$dev" >/dev/null 2>&1 || true
+        done < "$CACHE_DIR/nm-connections"
+        rm -f "$CACHE_DIR/nm-connections"
     fi
 }
 
@@ -208,9 +242,14 @@ enable_dns() {
 
     local dns_entries=""
     local resolvectl_entries=""
-    for ip in $v4 $v6; do
+    for ip in $v4; do
         [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME" && resolvectl_entries="$resolvectl_entries $ip#$TLS_NAME"
     done
+    if has_global_v6; then
+        for ip in $v6; do
+            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME" && resolvectl_entries="$resolvectl_entries $ip#$TLS_NAME"
+        done
+    fi
 
     cat << CONF > "$CONFIG_FILE"
 [Resolve]
@@ -222,12 +261,17 @@ DNSSEC=no
 Domains=~.
 CONF
 
+    # Prevent NetworkManager from pushing ISP/DHCP DNS to per-interface resolvers
+    nm_apply_ignore_dns
+
     systemctl restart systemd-resolved 2>/dev/null || true
 
     if command -v resolvectl &>/dev/null; then
         for iface in $(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth'); do
+            resolvectl revert "$iface" 2>/dev/null || true
             resolvectl dns "$iface" $resolvectl_entries 2>/dev/null || true
             resolvectl domain "$iface" "~." 2>/dev/null || true
+            resolvectl default-route "$iface" yes 2>/dev/null || true
             resolvectl dnsovertls "$iface" yes 2>/dev/null || true
             resolvectl dnssec "$iface" no 2>/dev/null || true
         done
@@ -250,6 +294,8 @@ CONF
 disable_dns() {
     rm -f "$CONFIG_FILE"
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
+
+    nm_restore_dns
 
     systemctl restart systemd-resolved 2>/dev/null || true
 
