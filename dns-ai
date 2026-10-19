@@ -134,20 +134,21 @@ determine_sni_ip() {
             ;;
         auto|*)
             local sni=""
+            # Check stable backup node first to eliminate timeout delay from failing primary node
+            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
+                echo "$BACKUP_SNI_IP"
+                return 0
+            fi
             if command -v resolvectl &>/dev/null; then
                 sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
             fi
-            if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]]; then
-                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 3.0; then
+            if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]] && [[ "$sni" != "$BACKUP_SNI_IP" ]]; then
+                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 2.0; then
                     echo "$sni"
                     return 0
                 fi
             fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 3.0; then
-                echo "$BACKUP_SNI_IP"
-                return 0
-            fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 3.0; then
+            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 1.5; then
                 echo "$PRIMARY_SNI_IP"
                 return 0
             fi
@@ -180,7 +181,7 @@ HOSTS
 }
 
 has_global_v6() {
-    [ -n "$(ip -6 addr show scope global 2>/dev/null)" ]
+    ip -6 route show default 2>/dev/null | grep -q default
 }
 
 nm_apply_ignore_dns() {
@@ -255,7 +256,7 @@ enable_dns() {
 [Resolve]
 DNS=
 DNS=$dns_entries
-FallbackDNS=1.1.1.1 8.8.8.8
+FallbackDNS=
 DNSOverTLS=yes
 DNSSEC=no
 Domains=~.
@@ -263,11 +264,26 @@ CONF
 
     # Prevent NetworkManager from pushing ISP/DHCP DNS to per-interface resolvers
     nm_apply_ignore_dns
+    if [ -d /etc/NetworkManager/conf.d ]; then
+        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+[main]
+dns=systemd-resolved
+
+[connection]
+ipv4.ignore-auto-dns=yes
+ipv6.ignore-auto-dns=yes
+NM_CONF
+        systemctl reload NetworkManager 2>/dev/null || true
+    fi
 
     systemctl restart systemd-resolved 2>/dev/null || true
 
     if command -v resolvectl &>/dev/null; then
-        for iface in $(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth'); do
+        local target_ifaces
+        target_ifaces=$(ip -o route show default 2>/dev/null | awk '{print $5}' | sort -u)
+        [ -z "$target_ifaces" ] && target_ifaces=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}' | sort -u)
+        [ -z "$target_ifaces" ] && target_ifaces=$(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth')
+        for iface in $target_ifaces; do
             resolvectl revert "$iface" 2>/dev/null || true
             resolvectl dns "$iface" $resolvectl_entries 2>/dev/null || true
             resolvectl domain "$iface" "~." 2>/dev/null || true
@@ -296,6 +312,10 @@ disable_dns() {
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
 
     nm_restore_dns
+    if [ -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf ]; then
+        rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+        systemctl reload NetworkManager 2>/dev/null || true
+    fi
 
     systemctl restart systemd-resolved 2>/dev/null || true
 
@@ -722,7 +742,7 @@ main_tui() {
             echo -e "  Google AI SNI:  ${C_YELLOW}без оверрайда${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
         fi
 
-        echo -e "  Защита сбоев:   ${C_GRAY}FallbackDNS=1.1.1.1 8.8.8.8${C_RESET}"
+        echo -e "  Резерв DoT:     ${C_GRAY}Два независимых узла DoT (194.87.196.13, 45.151.102.219)${C_RESET}"
         echo ""
         echo -e "  ${C_BLUE}0)${C_RESET} ${C_BOLD}Выйти${C_RESET}"
         echo -e "  ${C_GREEN}1)${C_RESET} $( is_active && echo -e "${C_RED}Выключить DNS-AI${C_RESET}" || echo -e "${C_GREEN}Включить DNS-AI${C_RESET}" )"
