@@ -78,10 +78,6 @@ install_dependencies() {
         cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
 [main]
 dns=systemd-resolved
-
-[connection]
-ipv4.ignore-auto-dns=yes
-ipv6.ignore-auto-dns=yes
 NM_CONF
         systemctl reload NetworkManager 2>/dev/null || true
     fi

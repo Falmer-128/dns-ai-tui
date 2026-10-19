@@ -189,35 +189,14 @@ nm_apply_ignore_dns() {
     systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
     mkdir -p "$CACHE_DIR"
 
-    # 1. Global NetworkManager drop-in: ignore DHCP DNS and enforce systemd-resolved
-    if [ -d /etc/NetworkManager/conf.d ]; then
-        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
-[main]
-dns=systemd-resolved
-
-[connection]
-ipv4.ignore-auto-dns=yes
-ipv6.ignore-auto-dns=yes
-NM_CONF
-    fi
-
-    # 2. Get active DNS-AI IPv4 servers
-    local ips
-    ips=$(get_current_ips)
-    local v4
-    v4=$(echo "$ips" | cut -d'|' -f1)
-
-    # 3. Explicitly modify active connections to ignore DHCP DNS and push DNS-AI servers
     nmcli -t -f UUID,TYPE,DEVICE connection show --active 2>/dev/null | while IFS=: read -r uuid type dev; do
         case "$type" in
             loopback|bridge|tun|wireguard|vpn|*docker*|dummy|"") continue ;;
         esac
+        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes 2>/dev/null || continue
         grep -qx "$uuid" "$CACHE_DIR/nm-connections" 2>/dev/null || printf '%s\n' "$uuid" >> "$CACHE_DIR/nm-connections"
-        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes ipv4.dns "$v4" 2>/dev/null || continue
         [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
     done
-
-    systemctl reload NetworkManager 2>/dev/null || true
 }
 
 nm_restore_dns() {
@@ -225,14 +204,12 @@ nm_restore_dns() {
     if [ -s "$CACHE_DIR/nm-connections" ]; then
         while read -r uuid; do
             [ -n "$uuid" ] || continue
-            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv4.dns "" ipv6.ignore-auto-dns no ipv6.dns "" 2>/dev/null || continue
+            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv6.ignore-auto-dns no 2>/dev/null || continue
             dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
             [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
         done < "$CACHE_DIR/nm-connections"
         rm -f "$CACHE_DIR/nm-connections"
     fi
-    rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf
-    systemctl reload NetworkManager 2>/dev/null || true
 }
 
 enable_dns() {
@@ -266,57 +243,29 @@ enable_dns() {
     fi
 
     local dns_entries=""
-    local resolvectl_entries=""
     for ip in $v4; do
-        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME" && resolvectl_entries="$resolvectl_entries $ip#$TLS_NAME"
+        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
     done
     if has_global_v6; then
         for ip in $v6; do
-            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME" && resolvectl_entries="$resolvectl_entries $ip#$TLS_NAME"
+            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
         done
     fi
 
     cat << CONF > "$CONFIG_FILE"
+# DNS-AI — systemd-resolved configuration
 [Resolve]
-DNS=
-DNS=$dns_entries
-FallbackDNS=
+DNS=${dns_entries# }
 DNSOverTLS=yes
-DNSSEC=no
 Domains=~.
+FallbackDNS=
 CONF
 
     # Prevent NetworkManager from pushing ISP/DHCP DNS to per-interface resolvers
     nm_apply_ignore_dns
-    if [ -d /etc/NetworkManager/conf.d ]; then
-        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
-[main]
-dns=systemd-resolved
-
-[connection]
-ipv4.ignore-auto-dns=yes
-ipv6.ignore-auto-dns=yes
-NM_CONF
-        systemctl reload NetworkManager 2>/dev/null || true
-    fi
 
     systemctl restart systemd-resolved 2>/dev/null || true
-
-    if command -v resolvectl &>/dev/null; then
-        local target_ifaces
-        target_ifaces=$(ip -o route show default 2>/dev/null | awk '{print $5}' | sort -u)
-        [ -z "$target_ifaces" ] && target_ifaces=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}' | sort -u)
-        [ -z "$target_ifaces" ] && target_ifaces=$(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth')
-        for iface in $target_ifaces; do
-            resolvectl revert "$iface" 2>/dev/null || true
-            resolvectl dns "$iface" $resolvectl_entries 2>/dev/null || true
-            resolvectl domain "$iface" "~." 2>/dev/null || true
-            resolvectl default-route "$iface" yes 2>/dev/null || true
-            resolvectl dnsovertls "$iface" yes 2>/dev/null || true
-            resolvectl dnssec "$iface" no 2>/dev/null || true
-        done
-        resolvectl flush-caches 2>/dev/null || true
-    fi
+    resolvectl flush-caches 2>/dev/null || true
 
     local sni_ip
     sni_ip=$(determine_sni_ip)
@@ -336,19 +285,9 @@ disable_dns() {
     sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
 
     nm_restore_dns
-    if [ -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf ]; then
-        rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf
-        systemctl reload NetworkManager 2>/dev/null || true
-    fi
 
     systemctl restart systemd-resolved 2>/dev/null || true
-
-    if command -v resolvectl &>/dev/null; then
-        for iface in $(ip -o link show up | awk -F': ' '{print $2}' | grep -vE 'lo|docker|br-|veth'); do
-            resolvectl revert "$iface" 2>/dev/null || true
-        done
-        resolvectl flush-caches 2>/dev/null || true
-    fi
+    resolvectl flush-caches 2>/dev/null || true
     echo -e "${C_YELLOW}✓ DNS-AI ВЫКЛЮЧЕН. Восстановлены стандартные настройки DNS и hosts.${C_RESET}"
 }
 
