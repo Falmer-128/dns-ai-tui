@@ -12,12 +12,12 @@ C_RED="\e[1;31m"
 C_RESET="\e[0m"
 
 if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        exec sudo bash "$0" "$@"
-    else
-        echo -e "${C_RED}Ошибка: Запустите деинсталлятор с правами root (sudo).${C_RESET}"
-        exit 1
-    fi
+    echo -e "${C_RED}Ошибка:${C_RESET} Для удаления требуются права суперпользователя."
+    echo -e "Запустите команду через sudo:"
+    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/uninstall.sh | sudo bash${C_RESET}"
+    echo -e "или:"
+    echo -e "  ${C_CYAN}sudo ./uninstall.sh${C_RESET}"
+    exit 1
 fi
 
 echo -e "${C_YELLOW}--> Отключение DNS-AI и восстановление системных настроек...${C_RESET}"

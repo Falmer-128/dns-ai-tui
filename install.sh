@@ -19,16 +19,16 @@ echo -e "${C_CYAN}╚═══════════════════�
 
 # Root check
 if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        exec sudo bash "$0" "$@"
-    else
-        echo -e "${C_RED}Ошибка: Запустите скрипт установки с правами root (sudo).${C_RESET}"
-        exit 1
-    fi
+    echo -e "${C_RED}Ошибка:${C_RESET} Для установки требуются права суперпользователя."
+    echo -e "Запустите команду через sudo:"
+    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/install.sh | sudo bash${C_RESET}"
+    echo -e "или:"
+    echo -e "  ${C_CYAN}sudo ./install.sh${C_RESET}"
+    exit 1
 fi
 
-# Detect directory of installer
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_RAW="https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
 # Check and install requirements for Debian, Ubuntu, Fedora, Arch, etc.
 install_dependencies() {
@@ -92,10 +92,27 @@ NM_CONF
 
 install_dependencies
 
+# Determine source of files (local repo or GitHub download)
+TMP_SRC=""
+if [ -n "${BASH_SOURCE[0]}" ] && [ -f "$SCRIPT_DIR/dns-ai" ] && [ -f "$SCRIPT_DIR/dns-ai.service" ]; then
+    SRC_DIR="$SCRIPT_DIR"
+else
+    echo -e "${C_CYAN}--> Загрузка файлов dns-ai и службы из GitHub...${C_RESET}"
+    TMP_SRC=$(mktemp -d /tmp/dns-ai-install.XXXXXX)
+    if ! curl -fsSL --max-time 15 "$REPO_RAW/dns-ai" -o "$TMP_SRC/dns-ai" || \
+       ! curl -fsSL --max-time 15 "$REPO_RAW/dns-ai.service" -o "$TMP_SRC/dns-ai.service"; then
+        echo -e "${C_RED}Ошибка: Не удалось загрузить установочные файлы с GitHub.${C_RESET}"
+        echo -e "${C_YELLOW}Проверьте подключение к интернету или доступность raw.githubusercontent.com.${C_RESET}"
+        rm -rf "$TMP_SRC"
+        exit 1
+    fi
+    SRC_DIR="$TMP_SRC"
+fi
+
 # Copy binary
 echo -e "${C_CYAN}--> Установка исполняемого файла /usr/local/bin/dns-ai...${C_RESET}"
 mkdir -p /usr/local/bin
-cp -f "$SCRIPT_DIR/dns-ai" /usr/local/bin/dns-ai
+cp -f "$SRC_DIR/dns-ai" /usr/local/bin/dns-ai
 chmod 755 /usr/local/bin/dns-ai
 
 # Symlink dns-ai-tui
@@ -104,9 +121,12 @@ ln -sf /usr/local/bin/dns-ai /usr/local/bin/dns-ai-tui
 # Install systemd service
 echo -e "${C_CYAN}--> Настройка системной службы автозагрузки (systemd)...${C_RESET}"
 mkdir -p /etc/systemd/system
-cp -f "$SCRIPT_DIR/dns-ai.service" /etc/systemd/system/dns-ai.service
+cp -f "$SRC_DIR/dns-ai.service" /etc/systemd/system/dns-ai.service
 chmod 644 /etc/systemd/system/dns-ai.service
 systemctl daemon-reload
+
+# Clean up temp source if used
+[ -n "$TMP_SRC" ] && rm -rf "$TMP_SRC"
 
 # Setup aliases in shells
 setup_shell_aliases() {
