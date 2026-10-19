@@ -11,7 +11,7 @@ set -o pipefail
 # Commands like 'test' and 'status' can run without root.
 # Interactive TUI and modifying commands require root privileges.
 case "$1" in
-    test|status)
+    test|status|-h|--help|help)
         ;;
     *)
         if [ "$(id -u)" -ne 0 ]; then
@@ -673,6 +673,49 @@ main_tui() {
     done
 }
 
+show_help() {
+    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║                  DNS-AI Management Console (CLI)                   ║${C_RESET}"
+    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+    echo -e "${C_BOLD}Использование:${C_RESET} ${C_CYAN}dns-ai${C_RESET} [КОМАНДА] [ПАРАМЕТРЫ]"
+    echo ""
+    echo -e "Если запустить ${C_CYAN}dns-ai${C_RESET} без аргументов, откроется интерактивное TUI-меню."
+    echo ""
+    echo -e "${C_BOLD}Основные команды:${C_RESET}"
+    echo -e "  ${C_GREEN}on${C_RESET} [IP...]               Включить DNS-over-TLS и маршрутизацию нейросетей"
+    echo -e "                           (опционально можно передать свои IP адреса)"
+    echo -e "  ${C_RED}off${C_RESET}                      Выключить DNS-AI, восстановить системный DNS"
+    echo -e "  ${C_YELLOW}toggle${C_RESET}                   Быстро переключить состояние (Вкл / Выкл)"
+    echo -e "  ${C_CYAN}status${C_RESET}                   Показать текущее состояние DoT, resolved и hosts"
+    echo -e "  ${C_MAGENTA}test${C_RESET}                     Комплексная диагностика (DoT 853, SNI прокси, AI)"
+    echo ""
+    echo -e "${C_BOLD}Автозагрузка и узлы:${C_RESET}"
+    echo -e "  ${C_CYAN}autostart${C_RESET} <действие>     Управление службой автозагрузки systemd:"
+    echo -e "                             ${C_GREEN}enable${C_RESET}   — включить автозагрузку при старте ОС"
+    echo -e "                             ${C_YELLOW}disable${C_RESET}  — выключить автозагрузку"
+    echo -e "                             ${C_CYAN}status${C_RESET}   — проверить текущее состояние"
+    echo -e "                             ${C_MAGENTA}toggle${C_RESET}   — переключить состояние"
+    echo -e "  ${C_CYAN}set-sni${C_RESET} <режим|IP>       Настройка промежуточного узла Google AI:"
+    echo -e "                             ${C_GREEN}auto${C_RESET}     — автоматический выбор с проверкой TLS"
+    echo -e "                             ${C_CYAN}backup${C_RESET}   — резервный узел ($BACKUP_SNI_IP) [стабилен]"
+    echo -e "                             ${C_YELLOW}primary${C_RESET}  — официальный узел ($PRIMARY_SNI_IP)"
+    echo -e "                             ${C_RED}none${C_RESET}     — отключить оверрайд Google AI"
+    echo -e "                             ${C_WHITE}<IP>${C_RESET}     — использовать свой IP адрес"
+    echo -e "  ${C_CYAN}set-ip${C_RESET} <IP1> [IP2]       Указать пользовательские DNS-серверы"
+    echo -e "  ${C_CYAN}update${C_RESET}                   Обновить список серверов (endpoints.json)"
+    echo -e "  ${C_RED}reset${C_RESET}                    Полный сброс параметров сети до стандартных"
+    echo -e "  ${C_CYAN}tui${C_RESET}, ${C_CYAN}menu${C_RESET}                Принудительный запуск интерактивной консоли"
+    echo -e "  ${C_BLUE}-h${C_RESET}, ${C_BLUE}--help${C_RESET}, ${C_BLUE}help${C_RESET}         Показать эту справку и выйти"
+    echo ""
+    echo -e "${C_BOLD}Примеры:${C_RESET}"
+    echo -e "  ${C_CYAN}dns-ai${C_RESET}                   # Интерактивное TUI-меню"
+    echo -e "  ${C_CYAN}dns-ai on${C_RESET}                # Включение с официальными серверами"
+    echo -e "  ${C_CYAN}dns-ai test${C_RESET}              # Полный тест доступности DoT и прокси"
+    echo -e "  ${C_CYAN}dns-ai set-sni backup${C_RESET}    # Переключение Google AI на резервный узел"
+    echo -e "  ${C_CYAN}dns-ai autostart enable${C_RESET}  # Включение запуска при загрузке системы"
+    echo ""
+}
+
 # ----------------- CLI Command Routing -----------------
 case "$1" in
     on|enable|start)
@@ -729,11 +772,14 @@ case "$1" in
         rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
         echo "✓ Сброс завершен."
         ;;
+    -h|--help|help)
+        show_help
+        ;;
     tui|menu|"")
         main_tui
         ;;
     *)
-        echo "Использование: dns-ai [on|off|toggle|status|test|update|autostart|set-sni|set-ip|reset|tui]"
+        show_help
         exit 1
         ;;
 esac
