@@ -188,14 +188,36 @@ nm_apply_ignore_dns() {
     command -v nmcli >/dev/null 2>&1 || return 0
     systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
     mkdir -p "$CACHE_DIR"
+
+    # 1. Global NetworkManager drop-in: ignore DHCP DNS and enforce systemd-resolved
+    if [ -d /etc/NetworkManager/conf.d ]; then
+        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+[main]
+dns=systemd-resolved
+
+[connection]
+ipv4.ignore-auto-dns=yes
+ipv6.ignore-auto-dns=yes
+NM_CONF
+    fi
+
+    # 2. Get active DNS-AI IPv4 servers
+    local ips
+    ips=$(get_current_ips)
+    local v4
+    v4=$(echo "$ips" | cut -d'|' -f1)
+
+    # 3. Explicitly modify active connections to ignore DHCP DNS and push DNS-AI servers
     nmcli -t -f UUID,TYPE,DEVICE connection show --active 2>/dev/null | while IFS=: read -r uuid type dev; do
         case "$type" in
             loopback|bridge|tun|wireguard|vpn|*docker*|dummy|"") continue ;;
         esac
-        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes 2>/dev/null || continue
         grep -qx "$uuid" "$CACHE_DIR/nm-connections" 2>/dev/null || printf '%s\n' "$uuid" >> "$CACHE_DIR/nm-connections"
-        [ -n "$dev" ] && nmcli device reapply "$dev" >/dev/null 2>&1 || true
+        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes ipv4.dns "$v4" 2>/dev/null || continue
+        [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
     done
+
+    systemctl reload NetworkManager 2>/dev/null || true
 }
 
 nm_restore_dns() {
@@ -203,12 +225,14 @@ nm_restore_dns() {
     if [ -s "$CACHE_DIR/nm-connections" ]; then
         while read -r uuid; do
             [ -n "$uuid" ] || continue
-            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv6.ignore-auto-dns no 2>/dev/null || continue
+            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv4.dns "" ipv6.ignore-auto-dns no ipv6.dns "" 2>/dev/null || continue
             dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
-            [ -n "$dev" ] && nmcli device reapply "$dev" >/dev/null 2>&1 || true
+            [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
         done < "$CACHE_DIR/nm-connections"
         rm -f "$CACHE_DIR/nm-connections"
     fi
+    rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+    systemctl reload NetworkManager 2>/dev/null || true
 }
 
 enable_dns() {
@@ -498,6 +522,14 @@ try:
     print(f'    generativelanguage.googleapis.com -> \033[1;37m{ips[:3]}\033[0m')
 except Exception as e:
     print(f'    \033[1;31m✗ Ошибка резолва: {e}\033[0m')
+
+print('\n\033[1;36m[5] Проверка признака работы DNS-AI (check.dns-ai.ru):\033[0m')
+try:
+    check_ip = socket.gethostbyname('check.dns-ai.ru')
+    print(f'    \033[1;32m✓\033[0m check.dns-ai.ru -> \033[1;32m{check_ip}\033[0m \033[0;32m(DoT DNS-AI подтвержден ОС!)\033[0m')
+except Exception:
+    print('    \033[1;31m✗\033[0m check.dns-ai.ru не разрешился.')
+    print('      \033[1;33mℹ Подсказка: Запросы идут через роутер/провайдер, а не через DNS-AI.\033[0m')
 "
     echo -e "${C_CYAN}════════════════════════════════════════════════════════════════════${C_RESET}"
 }
@@ -516,6 +548,17 @@ show_status() {
         sed -n '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/p' "$HOSTS_FILE"
     else
         echo "Записи DNS-AI в /etc/hosts отсутствуют."
+    fi
+    echo ""
+    echo -e "${C_CYAN}--- Проверка авторизации DoT (check.dns-ai.ru) ---${C_RESET}"
+    local check_ip
+    check_ip=$(resolvectl query check.dns-ai.ru 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
+    if [ -n "$check_ip" ]; then
+        echo -e "  Признак DNS-AI: ${C_GREEN}● ПОДТВЕРЖДЕНО ($check_ip)${C_RESET}"
+    else
+        echo -e "  Признак DNS-AI: ${C_RED}○ НЕ ОПРЕДЕЛЕН (запросы идут не через DNS-AI)${C_RESET}"
+        echo -e "  ${C_GRAY}Примечание: В браузере (Firefox/Chrome) отключите 'DNS over HTTPS' (DoH),${C_RESET}"
+        echo -e "  ${C_GRAY}чтобы браузер не ходил в обход системного DNS-over-TLS.${C_RESET}"
     fi
     echo ""
     echo -e "${C_CYAN}--- Активное состояние resolved ---${C_RESET}"
@@ -707,6 +750,12 @@ self_update() {
     rm -rf "$tmp_dir"
     echo ""
     echo -e "${C_GREEN}✓ Программа успешно обновлена до актуальной версии из GitHub!${C_RESET}"
+
+    if is_active; then
+        echo -e "${C_CYAN}--> Переприменение обновленной конфигурации DNS-AI...${C_RESET}"
+        enable_dns
+    fi
+
     echo ""
     read -p "$(echo -e "${C_CYAN}Нажмите Enter для перезапуска интерфейса...${C_RESET}")"
     exec /usr/local/bin/dns-ai "$@"
