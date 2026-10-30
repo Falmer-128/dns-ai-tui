@@ -1,924 +1,1863 @@
-#!/bin/bash
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # ==============================================================================
 #  DNS-AI Management Console & TUI
 #  Encrypted DNS-over-TLS & AI Services Reverse-Proxy Manager
 #  Author: Falmer-128 (https://github.com/Falmer-128/dns-ai-tui)
+#
+#  Pure Python 3 implementation (standard library only).
 # ==============================================================================
+"""DNS-AI management console.
 
-set -o pipefail
+This module replaces the original Bash implementation with a dependency-free
+Python 3 command line tool.  It manages systemd-resolved, /etc/hosts and
+NetworkManager state, while exposing both a CLI and the familiar ANSI TUI.
+"""
 
-# ----------------- Privilege Escalation -----------------
-# Commands like 'test' and 'status' can run without root.
-# Interactive TUI and modifying commands require root privileges.
-case "$1" in
-    test|status|-h|--help|help)
-        ;;
-    *)
-        if [ "$(id -u)" -ne 0 ]; then
-            if command -v sudo >/dev/null 2>&1; then
-                exec sudo "$0" "$@"
-            elif command -v doas >/dev/null 2>&1; then
-                exec doas "$0" "$@"
-            else
-                echo -e "\e[1;31mОшибка:\e[0m Для выполнения этого действия требуются права root (sudo)."
-                exit 1
-            fi
-        fi
-        ;;
-esac
+from __future__ import annotations
 
-# ----------------- Configuration & Constants -----------------
-CONFIG_DIR="/etc/systemd/resolved.conf.d"
-CONFIG_FILE="$CONFIG_DIR/dns-ai.conf"
-HOSTS_FILE="/etc/hosts"
-CACHE_DIR="/etc/dns-ai"
-CACHE_FILE="$CACHE_DIR/endpoints.json"
-MODE_FILE="$CACHE_DIR/sni_mode"
-SERVICE_NAME="dns-ai.service"
+import ast
+import contextlib
+import fcntl
+import ipaddress
+import json
+import os
+import py_compile
+import re
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-TLS_NAME="dns.dns-ai.ru"
-FALLBACK_V4="194.87.196.13 45.151.102.219"
-FALLBACK_V6="2a00:b700:5::3:62 2a12:5940:d4ef::219"
+VERSION = "2.0.0"
 
-PRIMARY_SNI_IP="109.120.131.200"
-BACKUP_SNI_IP="143.20.64.55"
+CONFIG_DIR = Path("/etc/systemd/resolved.conf.d")
+CONFIG_FILE = CONFIG_DIR / "90-dns-ai.conf"
+LEGACY_CONFIG_FILE = CONFIG_DIR / "dns-ai.conf"
+HOSTS_FILE = Path("/etc/hosts")
+STATE_DIR = Path("/var/lib/dns-ai")
+STATE_FILE = STATE_DIR / "state.json"
+RUN_DIR = Path("/run/dns-ai")
+LOCK_FILE = RUN_DIR / "state.lock"
 
-# Terminal Colors
-C_RESET="\e[0m"
-C_BOLD="\e[1m"
-C_CYAN="\e[1;36m"
-C_GREEN="\e[1;32m"
-C_YELLOW="\e[1;33m"
-C_RED="\e[1;31m"
-C_BLUE="\e[1;34m"
-C_MAGENTA="\e[1;35m"
-C_GRAY="\e[0;90m"
-C_WHITE="\e[1;37m"
+# Legacy locations, read once and then migrated into state.json.
+LEGACY_DIR = Path("/etc/dns-ai")
+LEGACY_CACHE_FILE = LEGACY_DIR / "endpoints.json"
+LEGACY_MODE_FILE = LEGACY_DIR / "sni_mode"
+LEGACY_NM_FILE = LEGACY_DIR / "nm-connections"
 
-mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
+SERVICE_NAME = "dns-ai.service"
+SERVICE_PATH = Path("/etc/systemd/system") / SERVICE_NAME
 
-# ----------------- Core Network Functions -----------------
-fetch_endpoints() {
-    local data=""
-    data=$(curl -fsSL --max-time 5 https://dns-ai.ru/endpoints.json 2>/dev/null || \
-           curl -fsSL --max-time 5 https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json 2>/dev/null || true)
-    if [ -n "$data" ] && echo "$data" | grep -q '"v4"'; then
-        mkdir -p "$CACHE_DIR" 2>/dev/null || true
-        echo "$data" > "$CACHE_FILE" 2>/dev/null || true
-        echo "$data"
-        return 0
-    elif [ -f "$CACHE_FILE" ]; then
-        cat "$CACHE_FILE"
-        return 0
-    fi
-    return 1
-}
+TLS_NAME = "dns.dns-ai.ru"
+GENERATIVE_HOST = "generativelanguage.googleapis.com"
+DEFAULT_V4: Tuple[str, ...] = ("194.87.196.13", "45.151.102.219")
+DEFAULT_V6: Tuple[str, ...] = ("2a00:b700:5::3:62", "2a12:5940:d4ef::219")
+PRIMARY_SNI_IP = "109.120.131.200"
+BACKUP_SNI_IP = "143.20.64.55"
 
-get_current_ips() {
-    local v4="" v6=""
-    local json=""
-    json=$(fetch_endpoints 2>/dev/null || true)
-    if [ -n "$json" ]; then
-        v4=$(echo "$json" | sed -n 's/.*"v4":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 2 | tr '\n' ' ')
-        v6=$(echo "$json" | sed -n 's/.*"v6":\[\([^]]*\)\].*/\1/p' | tr ',' '\n' | tr -d '" ' | grep ':' | head -n 2 | tr '\n' ' ')
-    fi
+AI_DOMAINS: Tuple[str, ...] = (
+    "generativelanguage.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "cloudaicompanion.googleapis.com",
+    "proactivebackend-pa.googleapis.com",
+    "alkalimakersuite-pa.clients6.google.com",
+    "aicode.googleapis.com",
+    "businessaicode.googleapis.com",
+    "aiplatform.googleapis.com",
+)
 
-    if [ -z "$v4" ]; then
-        v4="$FALLBACK_V4"
-        v6="$FALLBACK_V6"
-    fi
-    echo "$v4|$v6"
-}
+HOSTS_BEGIN = "# BEGIN DNS-AI-HOSTS"
+HOSTS_END = "# END DNS-AI-HOSTS"
 
-verify_sni_tls() {
-    local host="$1"
-    local ip="$2"
-    local timeout="${3:-2.5}"
-    python3 -c "
-import ssl, socket, sys
-try:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout($timeout)
-    s.connect(('$ip', 443))
-    ss = ctx.wrap_socket(s, server_hostname='$host')
-    ss.close()
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null
-}
+ENDPOINT_URLS: Tuple[str, ...] = (
+    "https://dns-ai.ru/endpoints.json",
+    "https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json",
+)
+REPO_BRANCH = os.environ.get("DNS_AI_BRANCH", "dev")
+REPO_RAW = f"https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/{REPO_BRANCH}"
+SCRIPT_URL = REPO_RAW + "/dns-ai"
+SERVICE_URL = REPO_RAW + "/dns-ai.service"
 
-determine_sni_ip() {
-    local mode="auto"
-    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_CYAN = "\033[1;36m"
+C_GREEN = "\033[1;32m"
+C_YELLOW = "\033[1;33m"
+C_RED = "\033[1;31m"
+C_BLUE = "\033[1;34m"
+C_MAGENTA = "\033[1;35m"
+C_GRAY = "\033[0;90m"
+C_WHITE = "\033[1;37m"
 
-    case "$mode" in
-        backup|143*)
-            echo "$BACKUP_SNI_IP"
-            return 0
-            ;;
-        primary|109*)
-            echo "$PRIMARY_SNI_IP"
-            return 0
-            ;;
-        none|disabled)
-            echo ""
-            return 0
-            ;;
-        manual:*)
-            echo "${mode#manual:}"
-            return 0
-            ;;
-        auto|*)
-            local sni=""
-            # Check stable backup node first to eliminate timeout delay from failing primary node
-            if verify_sni_tls "generativelanguage.googleapis.com" "$BACKUP_SNI_IP" 2.0; then
-                echo "$BACKUP_SNI_IP"
-                return 0
-            fi
-            if command -v resolvectl &>/dev/null; then
-                sni=$(resolvectl query generativelanguage.googleapis.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
-            fi
-            if [[ "$sni" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$sni" != 172.* ]] && [[ "$sni" != 142.* ]] && [[ "$sni" != 216.* ]] && [[ "$sni" != "$BACKUP_SNI_IP" ]]; then
-                if verify_sni_tls "generativelanguage.googleapis.com" "$sni" 2.0; then
-                    echo "$sni"
-                    return 0
-                fi
-            fi
-            if verify_sni_tls "generativelanguage.googleapis.com" "$PRIMARY_SNI_IP" 1.5; then
-                echo "$PRIMARY_SNI_IP"
-                return 0
-            fi
-            # Always fall back to tested BACKUP_SNI_IP so Google AI / AGY never stays broken
-            echo "$BACKUP_SNI_IP"
-            return 0
-            ;;
-    esac
-}
-
-update_hosts_entry() {
-    local sni_ip="$1"
-    sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
-
-    if [ -n "$sni_ip" ]; then
-        cat << HOSTS >> "$HOSTS_FILE"
-# BEGIN DNS-AI-HOSTS
-$sni_ip generativelanguage.googleapis.com
-$sni_ip daily-cloudcode-pa.googleapis.com
-$sni_ip cloudcode-pa.googleapis.com
-$sni_ip cloudaicompanion.googleapis.com
-$sni_ip proactivebackend-pa.googleapis.com
-$sni_ip alkalimakersuite-pa.clients6.google.com
-$sni_ip aicode.googleapis.com
-$sni_ip businessaicode.googleapis.com
-$sni_ip aiplatform.googleapis.com
-# END DNS-AI-HOSTS
-HOSTS
-    fi
-}
-
-has_global_v6() {
-    ip -6 route show default 2>/dev/null | grep -q default
-}
-
-nm_apply_ignore_dns() {
-    command -v nmcli >/dev/null 2>&1 || return 0
-    systemctl is-active --quiet NetworkManager 2>/dev/null || return 0
-    mkdir -p "$CACHE_DIR"
-
-    nmcli -t -f UUID,TYPE,DEVICE connection show --active 2>/dev/null | while IFS=: read -r uuid type dev; do
-        case "$type" in
-            loopback|bridge|tun|wireguard|vpn|*docker*|dummy|"") continue ;;
-        esac
-        nmcli connection modify "$uuid" ipv4.ignore-auto-dns yes ipv6.ignore-auto-dns yes 2>/dev/null || continue
-        grep -qx "$uuid" "$CACHE_DIR/nm-connections" 2>/dev/null || printf '%s\n' "$uuid" >> "$CACHE_DIR/nm-connections"
-        [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
-    done
-}
-
-nm_restore_dns() {
-    command -v nmcli >/dev/null 2>&1 || return 0
-    if [ -s "$CACHE_DIR/nm-connections" ]; then
-        while read -r uuid; do
-            [ -n "$uuid" ] || continue
-            nmcli connection modify "$uuid" ipv4.ignore-auto-dns no ipv6.ignore-auto-dns no 2>/dev/null || continue
-            dev=$(nmcli -g GENERAL.DEVICES connection show "$uuid" 2>/dev/null || true)
-            [ -n "$dev" ] && nmcli device reapply "$dev" 2>/dev/null || true
-        done < "$CACHE_DIR/nm-connections"
-        rm -f "$CACHE_DIR/nm-connections"
-    fi
-}
-
-enable_dns() {
-    local custom_v4="$1"
-    local v4="" v6=""
-
-    # Ensure systemd-resolved is active
-    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        systemctl enable --now systemd-resolved 2>/dev/null || true
-    fi
-
-    # Ensure /etc/resolv.conf points to systemd-resolved stub
-    if [ -d /run/systemd/resolve ] || [ -f /run/systemd/resolve/stub-resolv.conf ]; then
-        if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf 2>/dev/null)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
-            [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
-            rm -f /etc/resolv.conf
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-        fi
-    fi
-
-    if [ -n "$custom_v4" ]; then
-        v4="$custom_v4"
-        v6=""
-        echo -e "${C_CYAN}--> [DNS-AI] Использование ручных IP:${C_RESET} $v4"
-    else
-        local ips
-        ips=$(get_current_ips)
-        v4=$(echo "$ips" | cut -d'|' -f1)
-        v6=$(echo "$ips" | cut -d'|' -f2)
-        echo -e "${C_CYAN}--> [DNS-AI] Официальные эндпоинты:${C_RESET} $v4"
-    fi
-
-    local dns_entries=""
-    for ip in $v4; do
-        [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
-    done
-    if has_global_v6; then
-        for ip in $v6; do
-            [ -n "$ip" ] && dns_entries="$dns_entries $ip#$TLS_NAME"
-        done
-    fi
-
-    cat << CONF > "$CONFIG_FILE"
-# DNS-AI — systemd-resolved configuration
-[Resolve]
-DNS=${dns_entries# }
-DNSOverTLS=yes
-Domains=~.
-FallbackDNS=
-CONF
-
-    # Prevent NetworkManager from pushing ISP/DHCP DNS to per-interface resolvers
-    nm_apply_ignore_dns
-
-    systemctl restart systemd-resolved 2>/dev/null || true
-    resolvectl flush-caches 2>/dev/null || true
-
-    local sni_ip
-    sni_ip=$(determine_sni_ip)
-    if [ -n "$sni_ip" ]; then
-        update_hosts_entry "$sni_ip"
-        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
-        echo -e "${C_GREEN}✓ Google AI / Antigravity направлены на SNI-узел:${C_RESET} ${C_WHITE}$sni_ip${C_RESET}"
-    else
-        update_hosts_entry ""
-        echo -e "${C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ($TLS_NAME)!${C_RESET}"
-        echo -e "${C_YELLOW}⚠ Внимание: Ни один SNI-узел Google AI не ответил по TLS. Оверрайд /etc/hosts пропущен.${C_RESET}"
-    fi
-}
-
-disable_dns() {
-    rm -f "$CONFIG_FILE"
-    sed -i '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/d' "$HOSTS_FILE" 2>/dev/null || true
-
-    nm_restore_dns
-
-    systemctl restart systemd-resolved 2>/dev/null || true
-    resolvectl flush-caches 2>/dev/null || true
-    echo -e "${C_YELLOW}✓ DNS-AI ВЫКЛЮЧЕН. Восстановлены стандартные настройки DNS и hosts.${C_RESET}"
-}
-
-toggle_dns() {
-    if is_active; then
-        disable_dns
-    else
-        enable_dns
-    fi
-}
-
-# ----------------- Status Helpers -----------------
-is_active() {
-    [ -f "$CONFIG_FILE" ] && return 0
-    return 1
-}
-
-is_autostart_enabled() {
-    [ "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null)" = "enabled" ]
-}
-
-get_active_sni_in_hosts() {
-    if grep -q "BEGIN DNS-AI-HOSTS" "$HOSTS_FILE" 2>/dev/null; then
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*generativelanguage' "$HOSTS_FILE" 2>/dev/null | awk '{print $1}' | head -n 1
-    else
-        echo ""
-    fi
-}
-
-get_current_sni_mode_desc() {
-    local mode="auto"
-    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
-    case "$mode" in
-        backup) echo "Принудительно резерв ($BACKUP_SNI_IP)" ;;
-        primary) echo "Принудительно основной ($PRIMARY_SNI_IP)" ;;
-        none|disabled) echo "Отключен" ;;
-        manual:*) echo "Ручной (${mode#manual:})" ;;
-        auto|*) echo "Автоматический выбор (с проверкой TLS)" ;;
-    esac
-}
-
-# ----------------- Autostart Management -----------------
-manage_autostart() {
-    local action="$1"
-
-    # Ensure systemd service exists in /etc/systemd/system
-    if [ ! -f "/etc/systemd/system/$SERVICE_NAME" ]; then
-        cat << SERVICE > "/etc/systemd/system/$SERVICE_NAME"
-[Unit]
+SERVICE_CONTENT = """[Unit]
 Description=DNS-AI Encrypted DNS and AI Services Routing
 Documentation=https://github.com/Falmer-128/dns-ai-tui
-After=network-online.target systemd-resolved.service
-Wants=network-online.target systemd-resolved.service
+After=network-online.target time-sync.target systemd-resolved.service NetworkManager-wait-online.service
+Wants=network-online.target time-sync.target systemd-resolved.service
+ConditionPathExists=/usr/local/bin/dns-ai
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/dns-ai on
-ExecStop=/usr/local/bin/dns-ai off
+ExecStart=/usr/local/bin/dns-ai on --service
+ExecStop=/usr/local/bin/dns-ai off --service
+ExecReload=/usr/local/bin/dns-ai reconcile --quiet
+TimeoutStartSec=30
+SyslogIdentifier=dns-ai
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
-        systemctl daemon-reload 2>/dev/null || true
-    fi
+"""
 
-    case "$action" in
-        enable)
-            systemctl enable "$SERVICE_NAME" 2>/dev/null
-            systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_GREEN}✓ Служба $SERVICE_NAME успешно добавлена в автозагрузку!${C_RESET}"
-            ;;
-        disable)
-            systemctl disable "$SERVICE_NAME" 2>/dev/null
-            systemctl daemon-reload 2>/dev/null || true
-            echo -e "${C_YELLOW}✓ Служба $SERVICE_NAME успешно убрана из автозагрузки!${C_RESET}"
-            ;;
-        toggle)
-            if is_autostart_enabled; then
-                manage_autostart disable
-            else
-                manage_autostart enable
-            fi
-            ;;
-        status)
-            if is_autostart_enabled; then
-                echo -e "Автозагрузка: ${C_GREEN}ВКЛЮЧЕНА (systemd enabled)${C_RESET}"
-            else
-                echo -e "Автозагрузка: ${C_YELLOW}ОТКЛЮЧЕНА (systemd disabled)${C_RESET}"
-            fi
-            ;;
-    esac
-}
+QUIET = False
+_LOCK_FD: Optional[int] = None
+_LOCK_DEPTH = 0
 
-# ----------------- Diagnostic Test -----------------
-run_full_test() {
-    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║                Комплексная диагностика DNS-AI                      ║${C_RESET}"
-    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+# ------------------------------------------------------------------------------
+# Output and subprocess helpers
+# ------------------------------------------------------------------------------
 
-    python3 -c "
-import socket, ssl, time, json, urllib.request
+def set_quiet(value: bool) -> None:
+    """Enable or disable all normal command output."""
+    global QUIET
+    QUIET = bool(value)
 
-print('\033[1;36m[1] Проверка официального списка endpoints.json:\033[0m')
-data = None
-for url in ['https://dns-ai.ru/endpoints.json', 'https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json']:
+
+def say(message: str = "") -> None:
+    if not QUIET:
+        print(message)
+
+
+def warn(message: str) -> None:
+    if not QUIET:
+        print(f"{C_YELLOW}{message}{C_RESET}")
+
+
+def error(message: str) -> None:
+    if not QUIET:
+        print(f"{C_RED}✗ Ошибка:{C_RESET} {message}", file=sys.stderr)
+
+
+def clear_screen() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def c_locale_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return env
+
+
+def run_cmd(
+    args: Sequence[str],
+    timeout: float = 10,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    """Run a command without ever raising for common failures."""
     try:
-        t0 = time.time()
-        req = urllib.request.urlopen(url, timeout=4)
-        data = json.loads(req.read().decode('utf-8'))
-        dt = (time.time() - t0) * 1000
-        print(f'    \033[1;32m✓\033[0m {url} \033[0;90m({dt:.0f}ms, Serial {data.get(\"serial\", \"?\")})\033[0m')
-        break
-    except Exception as e:
-        print(f'    \033[1;31m✗\033[0m {url} \033[0;90m({e})\033[0m')
+        return subprocess.run(
+            list(args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(list(args), 127, "", f"not found: {args[0]}")
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(list(args), 124, "", f"timeout: {exc}")
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(args), 1, "", str(exc))
 
-v4_list = data.get('v4', ['194.87.196.13', '45.151.102.219']) if data else ['194.87.196.13', '45.151.102.219']
-retired = data.get('retired', []) if data else []
 
-print('\n\033[1;36m[2] Проверка серверов DNS-over-TLS (Порт 853):\033[0m')
-for ip in v4_list:
-    t0 = time.time()
+def short_error(exc: BaseException) -> str:
+    text = str(exc) or exc.__class__.__name__
+    return text if len(text) <= 100 else text[:97] + "..."
+
+
+# ------------------------------------------------------------------------------
+# Filesystem helpers: fsync, bind mounts, atomic replacement
+# ------------------------------------------------------------------------------
+
+def fsync_dir(directory: str) -> None:
     try:
-        s = socket.create_connection((ip, 853), timeout=3)
-        ctx = ssl.create_default_context()
-        ss = ctx.wrap_socket(s, server_hostname='dns.dns-ai.ru')
-        dt = (time.time() - t0) * 1000
-        ss.close()
-        print(f'    \033[1;32m✓\033[0m {ip}:853 DoT доступен \033[0;90m({dt:.1f}ms)\033[0m')
-    except Exception as e:
-        print(f'    \033[1;31m✗\033[0m {ip}:853 DoT ОШИБКА \033[0;90m({e})\033[0m')
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
-for ip in retired:
-    print(f'    \033[0;90mℹ {ip} — выведен из эксплуатации (retired upstream)\033[0m')
 
-print('\n\033[1;36m[3] Проверка промежуточных SNI-прокси для ИИ (Порт 443 TLS):\033[0m')
-def test_sni(host, ip, timeout=3):
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    t0 = time.time()
+def _unescape_mountinfo(value: str) -> str:
+    for old, new in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        value = value.replace(old, new)
+    return value
+
+
+def is_mountpoint(path: str) -> bool:
+    """Return True when *path* is a mount point (including a bind mount)."""
+    target = os.path.realpath(path)
     try:
-        s.connect((ip, 443))
-        ss = ctx.wrap_socket(s, server_hostname=host)
-        dt = (time.time() - t0) * 1000
-        ss.close()
-        return True, f'OK ({dt:.1f}ms)'
-    except Exception as e:
-        return False, f'FAIL ({e})'
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) > 4 and os.path.realpath(_unescape_mountinfo(fields[4])) == target:
+                    return True
+    except OSError:
+        pass
+    try:
+        return os.path.ismount(target)
+    except OSError:
+        return False
 
-targets = [
-    ('ChatGPT', 'chatgpt.com', '62.60.230.61'),
-    ('OpenAI API', 'api.openai.com', '62.60.230.61'),
-    ('Claude AI', 'claude.ai', '62.60.230.61'),
-    ('Google AI Primary', 'generativelanguage.googleapis.com', '109.120.131.200'),
-    ('Google AI Backup', 'generativelanguage.googleapis.com', '143.20.64.55'),
-]
 
-for label, host, ip in targets:
-    ok, res = test_sni(host, ip)
-    icon = '\033[1;32m✓\033[0m' if ok else '\033[1;31m✗\033[0m'
-    status_color = '\033[0;32m' if ok else '\033[0;31m'
-    print(f'    {icon} {label:<20} [{ip}]: {status_color}{res}\033[0m')
+def atomic_write_text(
+    path: Path,
+    text: str,
+    mode: Optional[int] = None,
+    force_inplace: bool = False,
+) -> None:
+    """Atomically write *text*, preserving owner when running as root.
 
-print('\n\033[1;36m[4] Текущая локальная резолюция в системе:\033[0m')
-try:
-    infos = socket.getaddrinfo('generativelanguage.googleapis.com', 443)
-    ips = list(set([item[4][0] for item in infos]))
-    print(f'    generativelanguage.googleapis.com -> \033[1;37m{ips[:3]}\033[0m')
-except Exception as e:
-    print(f'    \033[1;31m✗ Ошибка резолва: {e}\033[0m')
+    Bind mounts cannot be atomically replaced without detaching them, so they
+    are rewritten in place.  Symlinks are expected to be resolved by callers.
+    """
+    filename = os.path.abspath(str(path))
+    directory = os.path.dirname(filename) or "."
+    os.makedirs(directory, exist_ok=True)
 
-print('\n\033[1;36m[5] Проверка признака работы DNS-AI (check.dns-ai.ru):\033[0m')
-try:
-    check_ip = socket.gethostbyname('check.dns-ai.ru')
-    print(f'    \033[1;32m✓\033[0m check.dns-ai.ru -> \033[1;32m{check_ip}\033[0m \033[0;32m(DoT DNS-AI подтвержден ОС!)\033[0m')
-except Exception:
-    print('    \033[1;31m✗\033[0m check.dns-ai.ru не разрешился.')
-    print('      \033[1;33mℹ Подсказка: Запросы идут через роутер/провайдер, а не через DNS-AI.\033[0m')
-"
-    echo -e "${C_CYAN}════════════════════════════════════════════════════════════════════${C_RESET}"
-}
+    old_stat = None
+    try:
+        old_stat = os.stat(filename)
+    except OSError:
+        pass
+    if mode is None:
+        mode = stat.S_IMODE(old_stat.st_mode) if old_stat else 0o644
 
-show_status() {
-    echo -e "${C_CYAN}--- Глобальная конфигурация systemd-resolved ---${C_RESET}"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "Статус: ${C_GREEN}[ АКТИВЕН ]${C_RESET}"
-        cat "$CONFIG_FILE"
-    else
-        echo -e "Статус: ${C_YELLOW}[ ВЫКЛЮЧЕН ]${C_RESET}"
-    fi
-    echo ""
-    echo -e "${C_CYAN}--- Перенаправления в /etc/hosts ---${C_RESET}"
-    if grep -q "BEGIN DNS-AI-HOSTS" "$HOSTS_FILE" 2>/dev/null; then
-        sed -n '/# BEGIN DNS-AI-HOSTS/,/# END DNS-AI-HOSTS/p' "$HOSTS_FILE"
-    else
-        echo "Записи DNS-AI в /etc/hosts отсутствуют."
-    fi
-    echo ""
-    echo -e "${C_CYAN}--- Проверка авторизации DoT (check.dns-ai.ru) ---${C_RESET}"
-    local check_ip
-    check_ip=$(resolvectl query check.dns-ai.ru 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | awk '{print $1}')
-    if [ -n "$check_ip" ]; then
-        echo -e "  Признак DNS-AI: ${C_GREEN}● ПОДТВЕРЖДЕНО ($check_ip)${C_RESET}"
-    else
-        echo -e "  Признак DNS-AI: ${C_RED}○ НЕ ОПРЕДЕЛЕН (запросы идут не через DNS-AI)${C_RESET}"
-        echo -e "  ${C_GRAY}Примечание: В браузере (Firefox/Chrome) отключите 'DNS over HTTPS' (DoH),${C_RESET}"
-        echo -e "  ${C_GRAY}чтобы браузер не ходил в обход системного DNS-over-TLS.${C_RESET}"
-    fi
-    echo ""
-    echo -e "${C_CYAN}--- Активное состояние resolved ---${C_RESET}"
-    resolvectl status 2>/dev/null | grep -E "Current DNS Server|DNS Servers|DNSOverTLS|Link " | head -n 12 || true
-}
+    if force_inplace or is_mountpoint(filename):
+        with open(filename, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return
 
-# ----------------- TUI Submenus -----------------
-menu_sni_settings() {
-    while true; do
-        clear
-        echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_CYAN}║         Настройка Google AI SNI узла             ║${C_RESET}"
-        echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
-        echo -e "  Текущий режим:  ${C_WHITE}$(get_current_sni_mode_desc)${C_RESET}"
-        local active_ip
-        active_ip=$(get_active_sni_in_hosts)
-        if [ -n "$active_ip" ]; then
-            echo -e "  Активен в hosts: ${C_GREEN}$active_ip${C_RESET}"
-        else
-            echo -e "  Активен в hosts: ${C_YELLOW}нет оверрайда${C_RESET}"
-        fi
-        echo ""
-        echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
-        echo -e "  ${C_GREEN}1)${C_RESET} Автоматический выбор (проверка TLS при старте) [Рекомендуется]"
-        echo -e "  ${C_CYAN}2)${C_RESET} Принудительно резервный узел ($BACKUP_SNI_IP) [Проверен и стабилен]"
-        echo -e "  ${C_YELLOW}3)${C_RESET} Принудительно основной узел ($PRIMARY_SNI_IP)"
-        echo -e "  ${C_MAGENTA}4)${C_RESET} Указать свой IP вручную"
-        echo -e "  ${C_RED}5)${C_RESET} Отключить оверрайд Google AI"
-        echo ""
-        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-5]: ${C_RESET}")" sni_choice
-        case "$sni_choice" in
-            1)
-                echo "auto" > "$MODE_FILE"
-                if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен автоматический режим!${C_RESET}"
-                sleep 1.5
-                ;;
-            2)
-                echo "backup" > "$MODE_FILE"
-                if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен резервный узел ($BACKUP_SNI_IP)!${C_RESET}"
-                sleep 1.5
-                ;;
-            3)
-                echo "primary" > "$MODE_FILE"
-                if is_active; then enable_dns; fi
-                echo -e "${C_GREEN}✓ Установлен основной узел ($PRIMARY_SNI_IP)!${C_RESET}"
-                sleep 1.5
-                ;;
-            4)
-                read -p "Введите IP адрес SNI прокси: " manual_ip
-                if [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo "manual:$manual_ip" > "$MODE_FILE"
-                    if is_active; then enable_dns; fi
-                    echo -e "${C_GREEN}✓ Установлен пользовательский узел ($manual_ip)!${C_RESET}"
-                else
-                    echo -e "${C_RED}Некорректный IP адрес!${C_RESET}"
-                fi
-                sleep 2
-                ;;
-            5)
-                echo "none" > "$MODE_FILE"
-                update_hosts_entry ""
-                echo -e "${C_YELLOW}✓ Оверрайд Google AI отключен!${C_RESET}"
-                sleep 1.5
-                ;;
-            0|"")
-                break
-                ;;
-            *)
-                echo -e "${C_RED}Неверный выбор!${C_RESET}"
-                sleep 1
-                ;;
-        esac
-    done
-}
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{os.path.basename(filename)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        if old_stat is not None and os.geteuid() == 0:
+            try:
+                os.chown(tmp, old_stat.st_uid, old_stat.st_gid)
+            except OSError:
+                pass
+        os.replace(tmp, filename)
+        fsync_dir(directory)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
-menu_custom_dns() {
-    clear
-    echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║         Выбор пользовательских DNS серверов      ║${C_RESET}"
-    echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
-    echo "Введите один или два IPv4 адреса через пробел (или Enter для отмены):"
-    read -p "DNS IP: " custom_input
-    if [ -n "$custom_input" ]; then
-        enable_dns "$custom_input"
-        read -p "$(echo -e "${C_CYAN}Нажмите Enter для продолжения...${C_RESET}")"
-    fi
-}
 
-menu_autostart() {
-    while true; do
-        clear
-        echo -e "${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_CYAN}║          Управление автозагрузкой (Systemd)      ║${C_RESET}"
-        echo -e "${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
-        if is_autostart_enabled; then
-            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (служба запустится при старте ОС)${C_RESET}"
-        else
-            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА (служба не в автозагрузке)${C_RESET}"
-        fi
-        echo ""
-        echo -e "  ${C_BLUE}0)${C_RESET} Назад в главное меню"
-        if is_autostart_enabled; then
-            echo -e "  ${C_RED}1)${C_RESET} Убрать из автозагрузки (systemctl disable)"
-        else
-            echo -e "  ${C_GREEN}1)${C_RESET} Добавить в автозагрузку (systemctl enable)"
-        fi
-        echo -e "  ${C_CYAN}2)${C_RESET} Проверить статус службы (systemctl status)"
-        echo ""
-        read -p "$(echo -e "${C_CYAN}Выберите пункт [0-2]: ${C_RESET}")" auto_choice
-        case "$auto_choice" in
-            1)
-                manage_autostart toggle
-                sleep 1.5
-                ;;
-            2)
-                clear
-                systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
-                ;;
-            0|"")
-                break
-                ;;
-            *)
-                echo -e "${C_RED}Неверный выбор!${C_RESET}"
-                sleep 1
-                ;;
-        esac
-    done
-}
+def read_text(path: Path) -> str:
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+        return fh.read()
 
-# ----------------- Self-Update from GitHub -----------------
-self_update() {
-    clear
-    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║              Обновление программы DNS-AI из GitHub                 ║${C_RESET}"
-    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
-    echo -e "Проверка обновлений в репозитории: ${C_WHITE}https://github.com/Falmer-128/dns-ai-tui${C_RESET}"
-    echo ""
+# ------------------------------------------------------------------------------
+# State machine and flock based locking
+# ------------------------------------------------------------------------------
 
-    local tmp_dir
-    tmp_dir=$(mktemp -d /tmp/dns-ai-update.XXXXXX)
+def default_state() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "enabled": False,
+        "sni_mode": "auto",
+        "last_sni": "",
+        "dns_v4": [],
+        "dns_v6": [],
+        "nm_connections": [],
+        "endpoints": {},
+        "endpoints_updated": 0,
+        "updated_at": 0,
+    }
 
-    # 1. If running inside a git repository, pull latest changes
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-    if [ -d "$script_dir/.git" ] && command -v git >/dev/null 2>&1; then
-        echo -e "${C_CYAN}--> Обнаружен Git-репозиторий в $script_dir...${C_RESET}"
-        git -C "$script_dir" pull origin main 2>&1 || git -C "$script_dir" pull 2>&1 || true
-    fi
 
-    # 2. Download latest binary from GitHub
-    echo -e "${C_CYAN}--> Загрузка актуальной версии dns-ai с GitHub...${C_RESET}"
-    if ! curl -fsSL --max-time 15 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai" -o "$tmp_dir/dns-ai"; then
-        echo -e "${C_RED}✗ Ошибка: Не удалось скачать файл обновления. Проверьте сеть.${C_RESET}"
-        rm -rf "$tmp_dir"
-        echo ""
-        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+def _legacy_state() -> Dict[str, Any]:
+    """Read the old /etc/dns-ai files once, for seamless upgrades."""
+    state = default_state()
+    try:
+        mode = read_text(LEGACY_MODE_FILE).strip()
+        if mode:
+            state["sni_mode"] = mode
+    except OSError:
+        pass
+    try:
+        cached = json.loads(read_text(LEGACY_CACHE_FILE))
+        normalized = normalize_endpoints(cached)
+        if normalized:
+            state["endpoints"] = normalized
+    except (OSError, ValueError):
+        pass
+    try:
+        uuids = [line.strip() for line in read_text(LEGACY_NM_FILE).splitlines() if line.strip()]
+        state["nm_connections"] = uuids
+    except OSError:
+        pass
+    return state
+
+
+def load_state() -> Dict[str, Any]:
+    """Load state.json, falling back to legacy files and sane defaults."""
+    try:
+        data = json.loads(read_text(STATE_FILE))
+    except FileNotFoundError:
+        return _legacy_state()
+    except (OSError, ValueError):
+        return default_state()
+    if not isinstance(data, dict):
+        return default_state()
+
+    state = default_state()
+    state.update(data)
+    if not isinstance(state.get("sni_mode"), str):
+        state["sni_mode"] = "auto"
+    for key in ("dns_v4", "dns_v6", "nm_connections"):
+        value = state.get(key)
+        state[key] = [str(item) for item in value] if isinstance(value, list) else []
+    if not isinstance(state.get("endpoints"), dict):
+        state["endpoints"] = {}
+    return state
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    """Persist state atomically with fsync on both file and directory."""
+    state["updated_at"] = int(time.time())
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    payload = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(STATE_FILE, payload, mode=0o644)
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive re-entrant lock backed by fcntl.flock()."""
+    global _LOCK_FD, _LOCK_DEPTH
+    if _LOCK_DEPTH > 0:
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+        return
+
+    os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    _LOCK_FD = fd
+    _LOCK_DEPTH = 1
+    try:
+        yield
+    finally:
+        _LOCK_DEPTH = 0
+        _LOCK_FD = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def active_config_path() -> Optional[Path]:
+    """Return the active drop-in, accepting the pre-2.0 legacy filename."""
+    for candidate in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def is_active() -> bool:
+    """DNS-AI is considered active when its resolved drop-in exists."""
+    return active_config_path() is not None
+
+# ------------------------------------------------------------------------------
+# Endpoint catalogue (endpoints.json)
+# ------------------------------------------------------------------------------
+
+def valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def valid_ipv4(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
+
+
+def normalize_endpoints(data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    v4 = [str(item) for item in data.get("v4", []) if valid_ipv4(str(item))] if isinstance(data.get("v4"), list) else []
+    v6 = [str(item) for item in data.get("v6", []) if valid_ip(str(item)) and ":" in str(item)] if isinstance(data.get("v6"), list) else []
+    retired = [str(item) for item in data.get("retired", []) if valid_ipv4(str(item))] if isinstance(data.get("retired"), list) else []
+    if not v4:
+        return None
+    return {
+        "v4": v4[:8],
+        "v6": v6[:8],
+        "retired": retired[:20],
+        "serial": data.get("serial"),
+    }
+
+
+def download_endpoints(timeout: float = 5) -> Optional[Dict[str, Any]]:
+    """Download endpoints.json from the official mirrors (no caching)."""
+    for url in ENDPOINT_URLS:
+        request = urllib.request.Request(url, headers={"User-Agent": f"dns-ai/{VERSION}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read(1024 * 1024)
+            normalized = normalize_endpoints(json.loads(raw.decode("utf-8")))
+            if normalized:
+                return normalized
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            continue
+    return None
+
+
+def cache_endpoints(data: Dict[str, Any]) -> None:
+    with state_lock():
+        state = load_state()
+        state["endpoints"] = data
+        state["endpoints_updated"] = int(time.time())
+        save_state(state)
+
+
+def get_endpoints() -> Dict[str, Any]:
+    """Fetch fresh endpoints, else use the cache, else built-in defaults."""
+    data = download_endpoints()
+    if data:
+        try:
+            cache_endpoints(data)
+        except OSError:
+            pass
+        return data
+    cached = normalize_endpoints(load_state().get("endpoints"))
+    if cached:
+        return cached
+    return {
+        "v4": list(DEFAULT_V4),
+        "v6": list(DEFAULT_V6),
+        "retired": [],
+        "serial": None,
+    }
+
+
+def has_global_v6() -> bool:
+    if not command_exists("ip"):
+        return False
+    result = run_cmd(["ip", "-6", "route", "show", "default"], timeout=3)
+    return result.returncode == 0 and "default" in result.stdout
+
+# ------------------------------------------------------------------------------
+# Safe /etc/hosts management
+# ------------------------------------------------------------------------------
+
+def _real_hosts_path() -> str:
+    """Resolve a symlinked /etc/hosts, tolerating unusual container setups."""
+    path = str(HOSTS_FILE)
+    try:
+        if os.path.islink(path):
+            resolved = os.path.realpath(path)
+            if os.path.exists(resolved):
+                return resolved
+    except OSError:
+        pass
+    return path
+
+
+def strip_hosts_block(text: str) -> Tuple[str, str, int]:
+    """Remove DNS-AI blocks only when every BEGIN has a matching END.
+
+    Returns (new_text, status, removed_lines).  status is one of:
+    absent, removed, incomplete.  On "incomplete" the text is untouched.
+    """
+    lines = text.splitlines(keepends=True)
+    begins = [i for i, line in enumerate(lines) if line.strip() == HOSTS_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.strip() == HOSTS_END]
+    if not begins and not ends:
+        return text, "absent", 0
+    if len(begins) != len(ends):
+        return text, "incomplete", 0
+
+    ranges: List[Tuple[int, int]] = []
+    for begin, end in zip(begins, ends):
+        if begin >= end:
+            return text, "incomplete", 0
+        ranges.append((begin, end))
+
+    remove = set()
+    for begin, end in ranges:
+        remove.update(range(begin, end + 1))
+    kept = [line for index, line in enumerate(lines) if index not in remove]
+    return "".join(kept), "removed", len(remove)
+
+
+def build_hosts_block(ip: str) -> str:
+    if not ip:
+        return ""
+    rows = [HOSTS_BEGIN]
+    rows.extend(f"{ip} {domain}" for domain in AI_DOMAINS)
+    rows.append(HOSTS_END)
+    return "\n".join(rows) + "\n"
+
+
+def update_hosts_entry(ip: str) -> bool:
+    """Replace the DNS-AI block, preserving all unrelated hosts content."""
+    path = _real_hosts_path()
+    try:
+        text = read_text(Path(path))
+    except FileNotFoundError:
+        text = ""
+    except OSError as exc:
+        error(f"Не удалось прочитать {path}: {short_error(exc)}")
+        return False
+
+    new_text, status, _ = strip_hosts_block(text)
+    if status == "incomplete":
+        warn("В /etc/hosts найден только один маркер DNS-AI. Файл не изменён.")
+        return False
+
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    if ip:
+        new_text += build_hosts_block(ip)
+
+    if new_text == text:
+        return True
+    try:
+        atomic_write_text(Path(path), new_text, mode=0o644, force_inplace=is_mountpoint(path))
+        return True
+    except OSError as exc:
+        error(f"Не удалось обновить {path}: {short_error(exc)}")
+        return False
+
+
+def hosts_block_text() -> Optional[str]:
+    """Return the current DNS-AI block including markers, if complete."""
+    try:
+        lines = read_text(HOSTS_FILE).splitlines()
+    except OSError:
+        return None
+    begins = [i for i, line in enumerate(lines) if line.strip() == HOSTS_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.strip() == HOSTS_END]
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        return None
+    return "\n".join(lines[begins[0]:ends[0] + 1])
+
+
+def get_active_sni_in_hosts() -> str:
+    block = hosts_block_text()
+    if not block:
+        return ""
+    for line in block.splitlines():
+        match = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+generativelanguage\.googleapis\.com\b", line)
+        if match:
+            return match.group(1)
+    return ""
+
+# ------------------------------------------------------------------------------
+# systemd-resolved and NetworkManager
+# ------------------------------------------------------------------------------
+
+def is_resolved_active() -> bool:
+    if not command_exists("systemctl"):
+        return False
+    return run_cmd(["systemctl", "is-active", "--quiet", "systemd-resolved"], timeout=5).returncode == 0
+
+
+def ensure_resolved_active() -> bool:
+    if is_resolved_active():
+        return True
+    if not command_exists("systemctl"):
+        return False
+    run_cmd(["systemctl", "enable", "--now", "systemd-resolved"], timeout=20)
+    return is_resolved_active()
+
+
+def fix_resolv_conf() -> None:
+    """Point /etc/resolv.conf at the systemd-resolved stub when possible."""
+    stub = "/run/systemd/resolve/stub-resolv.conf"
+    if not os.path.exists(stub):
+        return
+    try:
+        if os.path.islink("/etc/resolv.conf") and os.readlink("/etc/resolv.conf") == stub:
+            return
+        if os.path.exists("/etc/resolv.conf") and not os.path.islink("/etc/resolv.conf"):
+            run_cmd(["cp", "-p", "/etc/resolv.conf", "/etc/resolv.conf.dns-ai.bak"], timeout=5)
+        try:
+            os.unlink("/etc/resolv.conf")
+        except FileNotFoundError:
+            pass
+        os.symlink(stub, "/etc/resolv.conf")
+    except OSError:
+        # Bind-mounted resolv.conf (containers) cannot be relinked.
+        pass
+
+
+def write_resolved_conf(v4: Sequence[str], v6: Sequence[str]) -> bool:
+    entries = [f"{ip}#{TLS_NAME}" for ip in v4 if ip]
+    entries.extend(f"{ip}#{TLS_NAME}" for ip in v6 if ip)
+    if not entries:
+        error("Нет DNS-серверов для настройки systemd-resolved.")
+        return False
+    content = (
+        "# DNS-AI — systemd-resolved configuration\n"
+        "[Resolve]\n"
+        f"DNS={' '.join(entries)}\n"
+        "DNSOverTLS=yes\n"
+        "Domains=~.\n"
+        "FallbackDNS=\n"
+    )
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(CONFIG_FILE, content, mode=0o644)
+        return True
+    except OSError as exc:
+        error(f"Не удалось записать {CONFIG_FILE}: {short_error(exc)}")
+        return False
+
+
+def restart_resolved() -> None:
+    if command_exists("systemctl"):
+        run_cmd(["systemctl", "restart", "systemd-resolved"], timeout=20)
+    if command_exists("resolvectl"):
+        run_cmd(["resolvectl", "flush-caches"], timeout=10)
+
+
+def _nm_active() -> bool:
+    if not command_exists("nmcli"):
+        return False
+    if not command_exists("systemctl"):
+        return True
+    return run_cmd(["systemctl", "is-active", "--quiet", "NetworkManager"], timeout=5).returncode == 0
+
+
+def nm_apply_ignore_dns(state: Dict[str, Any]) -> None:
+    """Stop NetworkManager from injecting DHCP DNS into per-link resolvers."""
+    if not _nm_active():
+        return
+    result = run_cmd(
+        ["nmcli", "-t", "-f", "UUID,TYPE,DEVICE", "connection", "show", "--active"],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return
+    known = set(state.get("nm_connections", []))
+    for line in result.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        uuid, conn_type = parts[0], parts[1].lower()
+        device = parts[2] if len(parts) > 2 else ""
+        if not uuid or conn_type in ("", "loopback", "bridge", "tun", "wireguard", "vpn", "dummy") or "docker" in conn_type:
+            continue
+        changed = run_cmd(
+            ["nmcli", "connection", "modify", uuid,
+             "ipv4.ignore-auto-dns", "yes", "ipv6.ignore-auto-dns", "yes"],
+            timeout=10,
+        )
+        if changed.returncode != 0:
+            continue
+        known.add(uuid)
+        if device:
+            run_cmd(["nmcli", "device", "reapply", device], timeout=15)
+    state["nm_connections"] = sorted(known)
+
+
+def nm_restore_dns(uuids: Iterable[str]) -> None:
+    if not command_exists("nmcli"):
+        return
+    for uuid in uuids:
+        if not uuid:
+            continue
+        run_cmd(
+            ["nmcli", "connection", "modify", uuid,
+             "ipv4.ignore-auto-dns", "no", "ipv6.ignore-auto-dns", "no"],
+            timeout=10,
+        )
+        device = run_cmd(
+            ["nmcli", "-g", "GENERAL.DEVICES", "connection", "show", uuid], timeout=5
+        ).stdout.strip()
+        if device:
+            run_cmd(["nmcli", "device", "reapply", device], timeout=15)
+
+# ------------------------------------------------------------------------------
+# SNI probes and resolvectl parsing
+# ------------------------------------------------------------------------------
+
+PRIVATE_NETS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+
+
+def is_private_or_reserved(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    if any(addr in net for net in PRIVATE_NETS if addr.version == net.version):
+        return True
+    return bool(
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_multicast or addr.is_unspecified
+    )
+
+
+def is_public_sni_candidate(ip: str) -> bool:
+    """Reject private ranges and Google's own directly reachable IPs."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.version != 4 or is_private_or_reserved(ip):
+        return False
+    return (int(addr) >> 24) not in (172, 142, 216)
+
+
+def verify_sni_tls(ip: str, timeout: float = 2.5, host: str = GENERATIVE_HOST) -> bool:
+    """Validate a TLS 443 handshake against the Google SNI hostname."""
+    context = ssl.create_default_context()
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            with context.wrap_socket(raw, server_hostname=host) as tls:
+                tls.do_handshake()
+        return True
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def parse_query_ip(output: str, name: str) -> Optional[str]:
+    """Parse both 'name: IP' and bare-IP resolvectl output formats."""
+    v4: List[str] = []
+    v6: List[str] = []
+    prefix = name.lower() + ":"
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("("):
+            continue
+        if line.lower().startswith(prefix):
+            line = line[len(prefix):].strip()
+        for token in re.split(r"[\s,;()\[\]]+", line):
+            token = token.strip(".").split("%", 1)[0]
+            if not token:
+                continue
+            try:
+                addr = ipaddress.ip_address(token)
+            except ValueError:
+                continue
+            if addr.version == 4:
+                v4.append(str(addr))
+            else:
+                v6.append(str(addr))
+    if v4:
+        return v4[0]
+    if v6:
+        return v6[0]
+    return None
+
+
+def resolvectl_query_ip(name: str) -> Optional[str]:
+    if not command_exists("resolvectl"):
+        return None
+    result = run_cmd(["resolvectl", "query", name], timeout=3, env=c_locale_env())
+    return parse_query_ip(result.stdout, name)
+
+
+def get_sni_mode() -> str:
+    mode = str(load_state().get("sni_mode") or "auto").strip()
+    return mode or "auto"
+
+
+def set_sni_mode(mode: str) -> None:
+    with state_lock():
+        state = load_state()
+        state["sni_mode"] = mode
+        save_state(state)
+
+
+def determine_sni_ip() -> str:
+    """Resolve the effective Google AI SNI IP according to the saved mode."""
+    mode = get_sni_mode()
+    if mode.startswith("manual:"):
+        return mode.split(":", 1)[1].strip()
+    if mode in ("backup", "143") or mode.startswith("143"):
+        return BACKUP_SNI_IP
+    if mode in ("primary", "109") or mode.startswith("109"):
+        return PRIMARY_SNI_IP
+    if mode in ("none", "disabled"):
+        return ""
+
+    # auto: probe the stable backup first, then DNS, then primary.
+    if verify_sni_tls(BACKUP_SNI_IP, 2.0):
+        return BACKUP_SNI_IP
+    candidate = resolvectl_query_ip(GENERATIVE_HOST)
+    if candidate and candidate != BACKUP_SNI_IP and is_public_sni_candidate(candidate):
+        if verify_sni_tls(candidate, 2.0):
+            return candidate
+    if verify_sni_tls(PRIMARY_SNI_IP, 1.5):
+        return PRIMARY_SNI_IP
+    return BACKUP_SNI_IP
+
+
+def get_sni_mode_desc() -> str:
+    mode = get_sni_mode()
+    if mode.startswith("manual:"):
+        return f"Ручной ({mode.split(':', 1)[1]})"
+    if mode == "backup" or mode.startswith("143"):
+        return f"Принудительно резерв ({BACKUP_SNI_IP})"
+    if mode == "primary" or mode.startswith("109"):
+        return f"Принудительно основной ({PRIMARY_SNI_IP})"
+    if mode in ("none", "disabled"):
+        return "Отключен"
+    return "Автоматический выбор (с проверкой TLS)"
+
+# ------------------------------------------------------------------------------
+# Core enable / disable operations
+# ------------------------------------------------------------------------------
+
+def _split_custom_ips(ips: Sequence[str]) -> Tuple[List[str], List[str]]:
+    v4: List[str] = []
+    v6: List[str] = []
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        (v4 if addr.version == 4 else v6).append(str(addr))
+    return v4, v6
+
+
+def enable_dns(
+    custom_ips: Optional[Sequence[str]] = None,
+    endpoint_data: Optional[Dict[str, Any]] = None,
+    quiet: bool = False,
+) -> bool:
+    """Enable DNS-over-TLS, host overrides and NetworkManager cooperation."""
+    global QUIET
+    previous_quiet = QUIET
+    if quiet:
+        QUIET = True
+    try:
+        if custom_ips:
+            v4, v6 = _split_custom_ips(custom_ips)
+            if not v4 and not v6:
+                error("Не указан ни один корректный IP-адрес.")
+                return False
+            include_v6 = bool(v6)
+            say(f"{C_CYAN}--> [DNS-AI] Использование ручных IP:{C_RESET} {' '.join(list(v4) + list(v6))}")
+        else:
+            data = endpoint_data or get_endpoints()
+            v4 = list(data.get("v4", []))[:2]
+            v6 = list(data.get("v6", []))[:2]
+            say(f"{C_CYAN}--> [DNS-AI] Официальные эндпоинты:{C_RESET} {' '.join(v4)}")
+            include_v6 = has_global_v6()
+
+        if not v4 and not v6:
+            error("Список DNS-серверов пуст.")
+            return False
+
+        ensure_resolved_active()
+        fix_resolv_conf()
+        if not write_resolved_conf(v4, v6 if include_v6 else []):
+            return False
+
+        # Remove the pre-2.0 drop-in so resolved cannot merge both files.
+        try:
+            LEGACY_CONFIG_FILE.unlink()
+        except OSError:
+            pass
+
+        with state_lock():
+            state = load_state()
+            nm_apply_ignore_dns(state)
+
+            restart_resolved()
+
+            sni_ip = determine_sni_ip()
+            if sni_ip:
+                update_hosts_entry(sni_ip)
+                state["last_sni"] = sni_ip
+            else:
+                update_hosts_entry("")
+                state["last_sni"] = ""
+
+            state["enabled"] = True
+            state["dns_v4"] = v4
+            state["dns_v6"] = v6 if include_v6 else []
+            save_state(state)
+
+        if sni_ip:
+            say(f"{C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ({TLS_NAME})!{C_RESET}")
+            say(f"{C_GREEN}✓ Google AI / Antigravity направлены на SNI-узел:{C_RESET} {C_WHITE}{sni_ip}{C_RESET}")
+        else:
+            say(f"{C_GREEN}✓ DNS-AI ВКЛЮЧЕН с DoT ({TLS_NAME})!{C_RESET}")
+            warn("⚠ Внимание: Ни один SNI-узел Google AI не ответил по TLS. Оверрайд /etc/hosts пропущен.")
+        return True
+    finally:
+        QUIET = previous_quiet
+
+
+def disable_dns(quiet: bool = False) -> bool:
+    """Disable DNS-AI and restore normal system DNS and hosts behaviour."""
+    global QUIET
+    previous_quiet = QUIET
+    if quiet:
+        QUIET = True
+    try:
+        with state_lock():
+            state = load_state()
+            for config_path in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+                try:
+                    config_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    if config_path == CONFIG_FILE:
+                        error(f"Не удалось удалить {CONFIG_FILE}: {short_error(exc)}")
+                        return False
+
+            update_hosts_entry("")
+            nm_restore_dns(state.get("nm_connections", []))
+            state["nm_connections"] = []
+            state["enabled"] = False
+            state["dns_v4"] = []
+            state["dns_v6"] = []
+            state["last_sni"] = ""
+            save_state(state)
+            restart_resolved()
+        say(f"{C_YELLOW}✓ DNS-AI ВЫКЛЮЧЕН. Восстановлены стандартные настройки DNS и hosts.{C_RESET}")
+        return True
+    finally:
+        QUIET = previous_quiet
+
+
+def toggle_dns() -> bool:
+    if is_active():
+        return disable_dns()
+    return enable_dns()
+
+
+def _sni_for_mode_without_probe() -> str:
+    """Fast SNI selection for the NetworkManager dispatcher (no TLS probes)."""
+    mode = get_sni_mode()
+    if mode.startswith("manual:"):
+        return mode.split(":", 1)[1].strip()
+    if mode == "backup" or mode.startswith("143"):
+        return BACKUP_SNI_IP
+    if mode == "primary" or mode.startswith("109"):
+        return PRIMARY_SNI_IP
+    if mode in ("none", "disabled"):
+        return ""
+    return str(load_state().get("last_sni") or "")
+
+
+def cmd_reconcile() -> int:
+    """Quietly re-apply saved settings after a NetworkManager event."""
+    global QUIET
+    previous_quiet = QUIET
+    try:
+        QUIET = True
+        if not is_active():
+            return 0
+        with state_lock():
+            state = load_state()
+            v4 = [ip for ip in state.get("dns_v4", []) if valid_ip(ip)]
+            v6 = [ip for ip in state.get("dns_v6", []) if valid_ip(ip)]
+            if (v4 or v6) and write_resolved_conf(v4, v6):
+                try:
+                    LEGACY_CONFIG_FILE.unlink()
+                except OSError:
+                    pass
+            ensure_resolved_active()
+            restart_resolved()
+            nm_apply_ignore_dns(state)
+            mode = get_sni_mode()
+            sni = _sni_for_mode_without_probe()
+            if mode not in ("auto",) or sni:
+                update_hosts_entry(sni)
+            save_state(state)
+        return 0
+    except Exception:
+        # A dispatcher hook must never break the network or print tracebacks.
+        return 0
+    finally:
+        QUIET = previous_quiet
+
+# ------------------------------------------------------------------------------
+# Status and diagnostics
+# ------------------------------------------------------------------------------
+
+def show_status() -> None:
+    print(f"{C_CYAN}--- Глобальная конфигурация systemd-resolved ---{C_RESET}")
+    config_path = active_config_path()
+    if config_path is not None:
+        print(f"Статус: {C_GREEN}[ АКТИВЕН ]{C_RESET}")
+        try:
+            print(read_text(config_path).rstrip("\n"))
+        except OSError as exc:
+            print(f"{C_RED}Не удалось прочитать конфигурацию: {short_error(exc)}{C_RESET}")
+    else:
+        print(f"Статус: {C_YELLOW}[ ВЫКЛЮЧЕН ]{C_RESET}")
+
+    print()
+    print(f"{C_CYAN}--- Перенаправления в /etc/hosts ---{C_RESET}")
+    block = hosts_block_text()
+    if block:
+        print(block)
+    else:
+        print("Записи DNS-AI в /etc/hosts отсутствуют.")
+
+    print()
+    print(f"{C_CYAN}--- Проверка авторизации DoT (check.dns-ai.ru) ---{C_RESET}")
+    check_ip = resolvectl_query_ip("check.dns-ai.ru")
+    if check_ip:
+        print(f"  Признак DNS-AI: {C_GREEN}● ПОДТВЕРЖДЕНО ({check_ip}){C_RESET}")
+    else:
+        print(f"  Признак DNS-AI: {C_RED}○ НЕ ОПРЕДЕЛЕН (запросы идут не через DNS-AI){C_RESET}")
+        print(f"  {C_GRAY}Примечание: В браузере (Firefox/Chrome) отключите 'DNS over HTTPS' (DoH),{C_RESET}")
+        print(f"  {C_GRAY}чтобы браузер не ходил в обход системного DNS-over-TLS.{C_RESET}")
+
+    print()
+    print(f"{C_CYAN}--- Активное состояние resolved ---{C_RESET}")
+    if command_exists("resolvectl"):
+        result = run_cmd(["resolvectl", "status"], timeout=5, env=c_locale_env())
+        wanted = ("Current DNS Server", "DNS Servers", "DNSOverTLS", "Link ")
+        lines = [line for line in result.stdout.splitlines() if any(key in line for key in wanted)]
+        for line in lines[:12]:
+            print(line)
+
+
+def _test_sni(host: str, ip: str, timeout: float = 3) -> Tuple[bool, str]:
+    context = ssl.create_default_context()
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    started = time.time()
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            with context.wrap_socket(raw, server_hostname=host) as tls:
+                tls.do_handshake()
+        return True, f"OK ({(time.time() - started) * 1000:.1f}ms)"
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        return False, f"FAIL ({short_error(exc)})"
+
+
+def run_full_test() -> None:
+    print(f"{C_CYAN}╔════════════════════════════════════════════════════════════════════╗{C_RESET}")
+    print(f"{C_CYAN}║                Комплексная диагностика DNS-AI                      ║{C_RESET}")
+    print(f"{C_CYAN}╚════════════════════════════════════════════════════════════════════╝{C_RESET}")
+
+    print(f"\n{C_CYAN}[1] Проверка официального списка endpoints.json:{C_RESET}")
+    data: Optional[Dict[str, Any]] = None
+    for url in ENDPOINT_URLS:
+        started = time.time()
+        request = urllib.request.Request(url, headers={"User-Agent": f"dns-ai/{VERSION}"})
+        try:
+            with urllib.request.urlopen(request, timeout=4) as response:
+                raw = response.read(1024 * 1024)
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("invalid JSON object")
+            data = parsed
+            elapsed = (time.time() - started) * 1000
+            print(f"    {C_GREEN}✓{C_RESET} {url} {C_GRAY}({elapsed:.0f}ms, Serial {parsed.get('serial', '?')}){C_RESET}")
+            break
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+            print(f"    {C_RED}✗{C_RESET} {url} {C_GRAY}({short_error(exc)}){C_RESET}")
+
+    v4_list = [ip for ip in (data or {}).get("v4", []) if valid_ipv4(str(ip))] or list(DEFAULT_V4)
+    retired = [ip for ip in (data or {}).get("retired", []) if valid_ipv4(str(ip))]
+
+    print(f"\n{C_CYAN}[2] Проверка серверов DNS-over-TLS (Порт 853):{C_RESET}")
+    for ip in v4_list:
+        started = time.time()
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((ip, 853), timeout=3) as raw:
+                with context.wrap_socket(raw, server_hostname=TLS_NAME) as tls:
+                    tls.do_handshake()
+            elapsed = (time.time() - started) * 1000
+            print(f"    {C_GREEN}✓{C_RESET} {ip}:853 DoT доступен {C_GRAY}({elapsed:.1f}ms){C_RESET}")
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            print(f"    {C_RED}✗{C_RESET} {ip}:853 DoT ОШИБКА {C_GRAY}({short_error(exc)}){C_RESET}")
+    for ip in retired:
+        print(f"    {C_GRAY}ℹ {ip} — выведен из эксплуатации (retired upstream){C_RESET}")
+
+    print(f"\n{C_CYAN}[3] Проверка промежуточных SNI-прокси для ИИ (Порт 443 TLS):{C_RESET}")
+    targets = [
+        ("ChatGPT", "chatgpt.com", "62.60.230.61"),
+        ("OpenAI API", "api.openai.com", "62.60.230.61"),
+        ("Claude AI", "claude.ai", "62.60.230.61"),
+        ("Google AI Primary", GENERATIVE_HOST, PRIMARY_SNI_IP),
+        ("Google AI Backup", GENERATIVE_HOST, BACKUP_SNI_IP),
+    ]
+    for label, host, ip in targets:
+        ok, result = _test_sni(host, ip)
+        icon = f"{C_GREEN}✓{C_RESET}" if ok else f"{C_RED}✗{C_RESET}"
+        status_color = "\033[0;32m" if ok else "\033[0;31m"
+        print(f"    {icon} {label:<20} [{ip}]: {status_color}{result}{C_RESET}")
+
+    print(f"\n{C_CYAN}[4] Текущая локальная резолюция в системе:{C_RESET}")
+    try:
+        infos = socket.getaddrinfo(GENERATIVE_HOST, 443)
+        ips: List[str] = []
+        for info in infos:
+            value = str(info[4][0])
+            if value not in ips:
+                ips.append(value)
+        print(f"    {GENERATIVE_HOST} -> {C_WHITE}{ips[:3]}{C_RESET}")
+    except OSError as exc:
+        print(f"    {C_RED}✗ Ошибка резолва: {short_error(exc)}{C_RESET}")
+
+    print(f"\n{C_CYAN}[5] Проверка признака работы DNS-AI (check.dns-ai.ru):{C_RESET}")
+    try:
+        check_ip = socket.gethostbyname("check.dns-ai.ru")
+        print(f"    {C_GREEN}✓{C_RESET} check.dns-ai.ru -> {C_GREEN}{check_ip}{C_RESET} \033[0;32m(DoT DNS-AI подтвержден ОС!)\033[0m")
+    except OSError:
+        print(f"    {C_RED}✗{C_RESET} check.dns-ai.ru не разрешился.")
+        print(f"      {C_YELLOW}ℹ Подсказка: Запросы идут через роутер/провайдера, а не через DNS-AI.{C_RESET}")
+    print(f"{C_CYAN}════════════════════════════════════════════════════════════════════{C_RESET}")
+
+
+# ------------------------------------------------------------------------------
+# systemd autostart management
+# ------------------------------------------------------------------------------
+
+def is_autostart_enabled() -> bool:
+    if not command_exists("systemctl"):
+        return False
+    return run_cmd(["systemctl", "is-enabled", SERVICE_NAME], timeout=5).stdout.strip() == "enabled"
+
+
+def ensure_service_file() -> None:
+    if SERVICE_PATH.is_file():
+        return
+    try:
+        SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(SERVICE_PATH, SERVICE_CONTENT, mode=0o644)
+        run_cmd(["systemctl", "daemon-reload"], timeout=10)
+    except OSError as exc:
+        error(f"Не удалось создать {SERVICE_PATH}: {short_error(exc)}")
+
+
+def manage_autostart(action: str = "status") -> int:
+    action = (action or "status").lower()
+    if action not in ("enable", "disable", "toggle", "status"):
+        print("Использование: dns-ai autostart <enable|disable|toggle|status>")
         return 1
-    fi
-
-    # 3. Syntax check
-    if ! bash -n "$tmp_dir/dns-ai" 2>/dev/null; then
-        echo -e "${C_RED}✗ Ошибка: Загруженный скрипт поврежден (синтаксическая ошибка). Обновление отменено.${C_RESET}"
-        rm -rf "$tmp_dir"
-        echo ""
-        read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата...${C_RESET}")"
+    if not command_exists("systemctl"):
+        error("systemctl не найден. Автозагрузка systemd недоступна.")
         return 1
-    fi
+    if action == "toggle":
+        action = "disable" if is_autostart_enabled() else "enable"
+    if action in ("enable", "disable"):
+        ensure_service_file()
+        result = run_cmd(["systemctl", action, SERVICE_NAME], timeout=15)
+        run_cmd(["systemctl", "daemon-reload"], timeout=10)
+        if result.returncode != 0:
+            error(f"systemctl {action} {SERVICE_NAME}: {short_error(result.stderr or result.stdout)}")
+            return 1
+        if action == "enable":
+            print(f"{C_GREEN}✓ Служба {SERVICE_NAME} успешно добавлена в автозагрузку!{C_RESET}")
+        else:
+            print(f"{C_YELLOW}✓ Служба {SERVICE_NAME} успешно убрана из автозагрузки!{C_RESET}")
+        return 0
+    if is_autostart_enabled():
+        print(f"Автозагрузка: {C_GREEN}ВКЛЮЧЕНА (systemd enabled){C_RESET}")
+    else:
+        print(f"Автозагрузка: {C_YELLOW}ОТКЛЮЧЕНА (systemd disabled){C_RESET}")
+    return 0
 
-    # 4. Download latest systemd service
-    curl -fsSL --max-time 10 "https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/dns-ai.service" -o "$tmp_dir/dns-ai.service" 2>/dev/null || true
+# ------------------------------------------------------------------------------
+# Self-update from GitHub
+# ------------------------------------------------------------------------------
 
-    # 5. Install binary
-    echo -e "${C_CYAN}--> Применение обновления...${C_RESET}"
-    mkdir -p /usr/local/bin
-    cp -f "$tmp_dir/dns-ai" /usr/local/bin/dns-ai
-    chmod 755 /usr/local/bin/dns-ai
-    ln -sf /usr/local/bin/dns-ai /usr/local/bin/dns-ai-tui
+def download_bytes(url: str, timeout: float = 20) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": f"dns-ai/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read(2 * 1024 * 1024)
 
-    if [ -s "$tmp_dir/dns-ai.service" ]; then
-        cp -f "$tmp_dir/dns-ai.service" /etc/systemd/system/dns-ai.service
-        chmod 644 /etc/systemd/system/dns-ai.service
-        systemctl daemon-reload 2>/dev/null || true
-    fi
 
-    rm -rf "$tmp_dir"
-    echo ""
-    echo -e "${C_GREEN}✓ Программа успешно обновлена до актуальной версии из GitHub!${C_RESET}"
+def self_update() -> int:
+    print(f"{C_CYAN}╔════════════════════════════════════════════════════════════════════╗{C_RESET}")
+    print(f"{C_CYAN}║              Обновление программы DNS-AI из GitHub                 ║{C_RESET}")
+    print(f"{C_CYAN}╚════════════════════════════════════════════════════════════════════╝{C_RESET}")
+    print(f"Проверка обновлений в репозитории: {C_WHITE}https://github.com/Falmer-128/dns-ai-tui{C_RESET}\n")
 
-    if is_active; then
-        echo -e "${C_CYAN}--> Переприменение обновленной конфигурации DNS-AI...${C_RESET}"
-        enable_dns
-    fi
+    print(f"{C_CYAN}--> Загрузка актуальной версии dns-ai с GitHub...{C_RESET}")
+    try:
+        payload = download_bytes(SCRIPT_URL, timeout=20)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        error(f"Не удалось скачать файл обновления: {short_error(exc)}")
+        _pause()
+        return 1
 
-    echo ""
-    read -p "$(echo -e "${C_CYAN}Нажмите Enter для перезапуска интерфейса...${C_RESET}")"
-    exec /usr/local/bin/dns-ai "$@"
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        error(f"Загруженный файл не является UTF-8: {short_error(exc)}")
+        _pause()
+        return 1
+    if not text.startswith("#!/usr/bin/env python3"):
+        error("Загруженный файл не является Python-скриптом dns-ai. Обновление отменено.")
+        _pause()
+        return 1
+    try:
+        ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        error(f"Загруженный скрипт повреждён (ast): {short_error(exc)}. Обновление отменено.")
+        _pause()
+        return 1
+
+    target = Path(os.path.realpath(__file__))
+    if not os.access(str(target.parent), os.W_OK):
+        target = Path("/usr/local/bin/dns-ai")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        error(f"Не удалось подготовить каталог {target.parent}: {short_error(exc)}")
+        _pause()
+        return 1
+
+    temp_name = ""
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".dns-ai-update-", suffix=".py", dir=str(target.parent)
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        py_compile.compile(temp_name, cfile=temp_name + "c", doraise=True)
+        try:
+            os.unlink(temp_name + "c")
+        except OSError:
+            pass
+    except (OSError, py_compile.PyCompileError) as exc:
+        error(f"Проверка загруженного скрипта не пройдена: {short_error(exc)}. Обновление отменено.")
+        _cleanup_temp(temp_name)
+        _pause()
+        return 1
+
+    old_stat = None
+    try:
+        old_stat = os.stat(target)
+    except OSError:
+        pass
+    try:
+        os.chmod(temp_name, 0o755)
+        if old_stat is not None and os.geteuid() == 0:
+            try:
+                os.chown(temp_name, old_stat.st_uid, old_stat.st_gid)
+            except OSError:
+                pass
+        print(f"{C_CYAN}--> Применение обновления...{C_RESET}")
+        os.replace(temp_name, target)
+        temp_name = ""
+        fsync_dir(str(target.parent))
+    except OSError as exc:
+        error(f"Не удалось установить обновление: {short_error(exc)}")
+        _cleanup_temp(temp_name)
+        _pause()
+        return 1
+
+    # Keep the familiar dns-ai-tui alias when updating the installed copy.
+    if target == Path("/usr/local/bin/dns-ai"):
+        link = Path("/usr/local/bin/dns-ai-tui")
+        try:
+            if link.is_symlink() or not link.exists():
+                link.unlink(missing_ok=True)
+                link.symlink_to(target)
+        except OSError:
+            pass
+
+    # Optionally refresh the systemd unit as well.
+    try:
+        service_payload = download_bytes(SERVICE_URL, timeout=10).decode("utf-8")
+        if "[Unit]" in service_payload and "ExecStart=" in service_payload:
+            atomic_write_text(SERVICE_PATH, service_payload, mode=0o644)
+            run_cmd(["systemctl", "daemon-reload"], timeout=10)
+    except Exception:
+        # The unit file is optional; a failure here must not abort the update.
+        pass
+
+    print(f"\n{C_GREEN}✓ Программа успешно обновлена до актуальной версии из GitHub!{C_RESET}")
+    if is_active():
+        print(f"{C_CYAN}--> Переприменение обновленной конфигурации DNS-AI...{C_RESET}")
+        enable_dns()
+
+    _pause("Нажмите Enter для перезапуска интерфейса...")
+    interactive = sys.stdin.isatty()
+    restart_args = [str(target), "tui"] if interactive else [str(target), "status"]
+    try:
+        os.execv(str(target), restart_args)
+    except OSError as exc:
+        error(f"Не удалось перезапустить интерфейс: {short_error(exc)}")
+        return 1
+    return 0
+
+
+def _cleanup_temp(name: str) -> None:
+    if not name:
+        return
+    for candidate in (name, name + "c"):
+        try:
+            os.unlink(candidate)
+        except OSError:
+            pass
+
+
+def _pause(message: str = "Нажмите Enter для возврата...") -> None:
+    if not sys.stdin.isatty():
+        return
+    try:
+        input(f"{C_CYAN}{message}{C_RESET}")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+# ------------------------------------------------------------------------------
+# TUI submenus
+# ------------------------------------------------------------------------------
+
+def _read(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def menu_sni_settings() -> None:
+    while True:
+        clear_screen()
+        print(f"{C_CYAN}╔══════════════════════════════════════════════════╗{C_RESET}")
+        print(f"{C_CYAN}║         Настройка Google AI SNI узла             ║{C_RESET}")
+        print(f"{C_CYAN}╚══════════════════════════════════════════════════╝{C_RESET}")
+        print(f"  Текущий режим:  {C_WHITE}{get_sni_mode_desc()}{C_RESET}")
+        active_ip = get_active_sni_in_hosts()
+        if active_ip:
+            print(f"  Активен в hosts: {C_GREEN}{active_ip}{C_RESET}")
+        else:
+            print(f"  Активен в hosts: {C_YELLOW}нет оверрайда{C_RESET}")
+        print()
+        print(f"  {C_BLUE}0){C_RESET} Назад в главное меню")
+        print(f"  {C_GREEN}1){C_RESET} Автоматический выбор (проверка TLS при старте) [Рекомендуется]")
+        print(f"  {C_CYAN}2){C_RESET} Принудительно резервный узел ({BACKUP_SNI_IP}) [Проверен и стабилен]")
+        print(f"  {C_YELLOW}3){C_RESET} Принудительно основной узел ({PRIMARY_SNI_IP})")
+        print(f"  {C_MAGENTA}4){C_RESET} Указать свой IP вручную")
+        print(f"  {C_RED}5){C_RESET} Отключить оверрайд Google AI")
+        print()
+        choice = _read(f"{C_CYAN}Выберите пункт [0-5]: {C_RESET}").strip()
+
+        if choice == "1":
+            set_sni_mode("auto")
+            if is_active():
+                enable_dns()
+            print(f"{C_GREEN}✓ Установлен автоматический режим!{C_RESET}")
+            time.sleep(1.5)
+        elif choice == "2":
+            set_sni_mode("backup")
+            if is_active():
+                enable_dns()
+            print(f"{C_GREEN}✓ Установлен резервный узел ({BACKUP_SNI_IP})!{C_RESET}")
+            time.sleep(1.5)
+        elif choice == "3":
+            set_sni_mode("primary")
+            if is_active():
+                enable_dns()
+            print(f"{C_GREEN}✓ Установлен основной узел ({PRIMARY_SNI_IP})!{C_RESET}")
+            time.sleep(1.5)
+        elif choice == "4":
+            manual_ip = _read("Введите IP адрес SNI прокси: ").strip()
+            try:
+                ipaddress.IPv4Address(manual_ip)
+                valid = True
+            except ValueError:
+                valid = False
+            if valid:
+                set_sni_mode(f"manual:{manual_ip}")
+                if is_active():
+                    enable_dns()
+                print(f"{C_GREEN}✓ Установлен пользовательский узел ({manual_ip})!{C_RESET}")
+            else:
+                print(f"{C_RED}Некорректный IP адрес!{C_RESET}")
+            time.sleep(2)
+        elif choice == "5":
+            set_sni_mode("none")
+            update_hosts_entry("")
+            print(f"{C_YELLOW}✓ Оверрайд Google AI отключен!{C_RESET}")
+            time.sleep(1.5)
+        elif choice in ("0", ""):
+            break
+        else:
+            print(f"{C_RED}Неверный выбор!{C_RESET}")
+            time.sleep(1)
+
+def menu_custom_dns() -> None:
+    clear_screen()
+    print(f"{C_CYAN}╔══════════════════════════════════════════════════╗{C_RESET}")
+    print(f"{C_CYAN}║         Выбор пользовательских DNS серверов      ║{C_RESET}")
+    print(f"{C_CYAN}╚══════════════════════════════════════════════════╝{C_RESET}")
+    print("Введите один или два IPv4 адреса через пробел (или Enter для отмены):")
+    value = _read("DNS IP: ").strip()
+    if value:
+        enable_dns(custom_ips=value.split())
+        _pause("Нажмите Enter для продолжения...")
+
+
+def menu_autostart() -> None:
+    while True:
+        clear_screen()
+        print(f"{C_CYAN}╔══════════════════════════════════════════════════╗{C_RESET}")
+        print(f"{C_CYAN}║          Управление автозагрузкой (Systemd)      ║{C_RESET}")
+        print(f"{C_CYAN}╚══════════════════════════════════════════════════╝{C_RESET}")
+        if is_autostart_enabled():
+            print(f"  Автозагрузка:   {C_GREEN}● ВКЛЮЧЕНА (служба запустится при старте ОС){C_RESET}")
+        else:
+            print(f"  Автозагрузка:   {C_YELLOW}○ ОТКЛЮЧЕНА (служба не в автозагрузке){C_RESET}")
+        print()
+        print(f"  {C_BLUE}0){C_RESET} Назад в главное меню")
+        if is_autostart_enabled():
+            print(f"  {C_RED}1){C_RESET} Убрать из автозагрузки (systemctl disable)")
+        else:
+            print(f"  {C_GREEN}1){C_RESET} Добавить в автозагрузку (systemctl enable)")
+        print(f"  {C_CYAN}2){C_RESET} Проверить статус службы (systemctl status)")
+        print()
+        choice = _read(f"{C_CYAN}Выберите пункт [0-2]: {C_RESET}").strip()
+
+        if choice == "1":
+            manage_autostart("toggle")
+            time.sleep(1.5)
+        elif choice == "2":
+            clear_screen()
+            if command_exists("systemctl"):
+                try:
+                    subprocess.run(
+                        ["systemctl", "status", SERVICE_NAME, "--no-pager"],
+                        text=True,
+                        errors="replace",
+                        timeout=20,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            else:
+                error("systemctl не найден.")
+            print()
+            _pause("Нажмите Enter для возврата...")
+        elif choice in ("0", ""):
+            break
+        else:
+            print(f"{C_RED}Неверный выбор!{C_RESET}")
+            time.sleep(1)
+
+# ------------------------------------------------------------------------------
+# Main TUI
+# ------------------------------------------------------------------------------
+
+def main_tui() -> int:
+    try:
+        while True:
+            clear_screen()
+            print(f"{C_CYAN}╔════════════════════════════════════════════════════════════════════╗{C_RESET}")
+            print(f"{C_CYAN}║                  DNS-AI Management Console                         ║{C_RESET}")
+            print(f"{C_CYAN}╚════════════════════════════════════════════════════════════════════╝{C_RESET}")
+
+            if is_active():
+                print(f"  Служба DNS-AI:  {C_GREEN}● РАБОТАЕТ (DoT {TLS_NAME} активен){C_RESET}")
+            else:
+                print(f"  Служба DNS-AI:  {C_RED}○ ВЫКЛЮЧЕН (используется системный DNS){C_RESET}")
+            if is_autostart_enabled():
+                print(f"  Автозагрузка:   {C_GREEN}● ВКЛЮЧЕНА (systemd service enabled){C_RESET}")
+            else:
+                print(f"  Автозагрузка:   {C_YELLOW}○ ОТКЛЮЧЕНА{C_RESET}")
+
+            active_sni = get_active_sni_in_hosts()
+            mode_desc = get_sni_mode_desc()
+            if active_sni:
+                print(f"  Google AI SNI:  {C_WHITE}{active_sni}{C_RESET} {C_GRAY}({mode_desc}){C_RESET}")
+            else:
+                print(f"  Google AI SNI:  {C_YELLOW}без оверрайда{C_RESET} {C_GRAY}({mode_desc}){C_RESET}")
+
+            print(f"  Резерв DoT:     {C_GRAY}Два независимых узла DoT (194.87.196.13, 45.151.102.219){C_RESET}")
+            print()
+            print(f"  {C_BLUE}0){C_RESET} {C_BOLD}Выйти{C_RESET}")
+            if is_active():
+                print(f"  {C_GREEN}1){C_RESET} {C_RED}Выключить DNS-AI{C_RESET}")
+            else:
+                print(f"  {C_GREEN}1){C_RESET} {C_GREEN}Включить DNS-AI{C_RESET}")
+            print(f"  {C_CYAN}2){C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)")
+            print(f"  {C_MAGENTA}3){C_RESET} Управление автозагрузкой (Systemd)")
+            print(f"  {C_YELLOW}4){C_RESET} Настройка Google AI SNI узла")
+            print(f"  {C_CYAN}5){C_RESET} Обновить список адресов (endpoints.json с dns-ai.ru)")
+            print(f"  {C_GREEN}6){C_RESET} Обновить программу из GitHub (Self-update)")
+            print(f"  {C_WHITE}7){C_RESET} Ручной ввод DNS IP")
+            print(f"  {C_GRAY}8){C_RESET} Подробная системная сводка (resolvectl)")
+            print(f"  {C_RED}9){C_RESET} Сбросить все настройки сети до стандартных")
+            print()
+            print(f"  {C_GRAY}Репозиторий проекта: https://github.com/Falmer-128/dns-ai-tui{C_RESET}")
+            print()
+            choice = _read(f"{C_CYAN}Выберите действие [0-9]: {C_RESET}").strip()
+
+            if choice == "1":
+                toggle_dns()
+                time.sleep(1.2)
+            elif choice == "2":
+                clear_screen()
+                run_full_test()
+                print()
+                _pause("Нажмите Enter для возврата в меню...")
+            elif choice == "3":
+                menu_autostart()
+            elif choice == "4":
+                menu_sni_settings()
+            elif choice == "5":
+                print(f"{C_CYAN}--> Загрузка актуальных адресов с dns-ai.ru...{C_RESET}")
+                data = download_endpoints()
+                if data:
+                    cache_endpoints(data)
+                    print(f"{C_GREEN}✓ Кэш адресов успешно обновлен!{C_RESET}")
+                    if is_active():
+                        enable_dns(endpoint_data=data)
+                else:
+                    print(f"{C_RED}✗ Не удалось загрузить адреса.{C_RESET}")
+                time.sleep(2)
+            elif choice == "6":
+                self_update()
+            elif choice == "7":
+                menu_custom_dns()
+            elif choice == "8":
+                clear_screen()
+                show_status()
+                print()
+                _pause("Нажмите Enter для возврата в меню...")
+            elif choice == "9":
+                print(f"{C_YELLOW}Сброс настроек DNS-AI и восстановление дефолтной сети...{C_RESET}")
+                reset_all("✓ Все настройки сброшены.")
+                time.sleep(2)
+            elif choice in ("0", "q", "Q", ""):
+                clear_screen()
+                return 0
+            else:
+                print(f"{C_RED}Неверный ввод! Попробуйте снова.{C_RESET}")
+                time.sleep(1)
+    except (KeyboardInterrupt, EOFError):
+        clear_screen()
+        return 0
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+
+def show_help() -> None:
+    print(f"{C_CYAN}╔════════════════════════════════════════════════════════════════════╗{C_RESET}")
+    print(f"{C_CYAN}║                  DNS-AI Management Console (CLI)                   ║{C_RESET}")
+    print(f"{C_CYAN}╚════════════════════════════════════════════════════════════════════╝{C_RESET}")
+    print(f"{C_BOLD}Использование:{C_RESET} {C_CYAN}dns-ai{C_RESET} [КОМАНДА] [ПАРАМЕТРЫ]\n")
+    print(f"Если запустить {C_CYAN}dns-ai{C_RESET} без аргументов, откроется интерактивное TUI-меню.\n")
+    print(f"{C_BOLD}Основные команды:{C_RESET}")
+    print(f"  {C_GREEN}on{C_RESET} [IP...]               Включить DNS-over-TLS и маршрутизацию нейросетей")
+    print("                           (опционально можно передать свои IP адреса)")
+    print(f"  {C_RED}off{C_RESET}                      Выключить DNS-AI, восстановить системный DNS")
+    print(f"  {C_YELLOW}toggle{C_RESET}                   Быстро переключить состояние (Вкл / Выкл)")
+    print(f"  {C_CYAN}status{C_RESET}                   Показать текущее состояние DoT, resolved и hosts")
+    print(f"  {C_MAGENTA}test{C_RESET}                     Комплексная диагностика (DoT 853, SNI прокси, AI)")
+    print(f"  {C_GRAY}reconcile{C_RESET}                Тихий повтор настроек (для NetworkManager dispatcher)")
+    print()
+    print(f"{C_BOLD}Автозагрузка и узлы:{C_RESET}")
+    print(f"  {C_CYAN}autostart{C_RESET} <действие>     Управление службой автозагрузки systemd:")
+    print(f"                             {C_GREEN}enable{C_RESET}   — включить автозагрузку при старте ОС")
+    print(f"                             {C_YELLOW}disable{C_RESET}  — выключить автозагрузку")
+    print(f"                             {C_CYAN}status{C_RESET}   — проверить текущее состояние")
+    print(f"                             {C_MAGENTA}toggle{C_RESET}   — переключить состояние")
+    print(f"  {C_CYAN}set-sni{C_RESET} <режим|IP>       Настройка промежуточного узла Google AI:")
+    print(f"                             {C_GREEN}auto{C_RESET}     — автоматический выбор с проверкой TLS")
+    print(f"                             {C_CYAN}backup{C_RESET}   — резервный узел ({BACKUP_SNI_IP}) [стабилен]")
+    print(f"                             {C_YELLOW}primary{C_RESET}  — официальный узел ({PRIMARY_SNI_IP})")
+    print(f"                             {C_RED}none{C_RESET}     — отключить оверрайд Google AI")
+    print(f"                             {C_WHITE}<IP>{C_RESET}     — использовать свой IP адрес")
+    print(f"  {C_CYAN}set-ip{C_RESET} <IP1> [IP2]       Указать пользовательские DNS-серверы")
+    print(f"  {C_CYAN}update{C_RESET}                   Обновить список серверов (endpoints.json)")
+    print(f"  {C_GREEN}upgrade{C_RESET}, {C_GREEN}self-update{C_RESET}     Обновить саму программу из GitHub")
+    print(f"  {C_RED}reset{C_RESET}                    Полный сброс параметров сети до стандартных")
+    print(f"  {C_CYAN}tui{C_RESET}, {C_CYAN}menu{C_RESET}                Принудительный запуск интерактивной консоли")
+    print(f"  {C_BLUE}-h{C_RESET}, {C_BLUE}--help{C_RESET}, {C_BLUE}help{C_RESET}         Показать эту справку и выйти\n")
+    print(f"{C_BOLD}Примеры:{C_RESET}")
+    print(f"  {C_CYAN}dns-ai{C_RESET}                   # Интерактивное TUI-меню")
+    print(f"  {C_CYAN}dns-ai on{C_RESET}                # Включение с официальными серверами")
+    print(f"  {C_CYAN}dns-ai test{C_RESET}              # Полный тест доступности DoT и прокси")
+    print(f"  {C_CYAN}dns-ai upgrade{C_RESET}           # Обновление программы из GitHub")
+    print(f"  {C_CYAN}dns-ai set-sni backup{C_RESET}    # Переключение Google AI на резервный узел")
+    print(f"  {C_CYAN}dns-ai autostart enable{C_RESET}  # Включение запуска при загрузке системы")
+    print()
+
+# ------------------------------------------------------------------------------
+# Reset and CLI command handlers
+# ------------------------------------------------------------------------------
+
+def reset_all(final_message: str) -> int:
+    disable_dns()
+    manage_autostart("disable")
+    for legacy in (LEGACY_MODE_FILE, LEGACY_CACHE_FILE, LEGACY_NM_FILE):
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+    with state_lock():
+        save_state(default_state())
+    print(f"{C_GREEN}{final_message}{C_RESET}")
+    return 0
+
+
+def _validate_ips(values: Sequence[str]) -> Optional[List[str]]:
+    cleaned: List[str] = []
+    for value in values:
+        try:
+            cleaned.append(str(ipaddress.ip_address(value)))
+        except ValueError:
+            error(f"Некорректный IP-адрес: {value}")
+            return None
+    return cleaned
+
+
+def _normalize_sni(value: str) -> Optional[str]:
+    value = value.strip()
+    if value in ("auto", "backup", "primary", "none", "disabled"):
+        return value
+    if value.startswith("manual:"):
+        candidate = value.split(":", 1)[1].strip()
+        return f"manual:{candidate}" if valid_ip(candidate) else None
+    if valid_ip(value):
+        return f"manual:{value}"
+    return None
+
+
+def cmd_on(args: Sequence[str]) -> int:
+    clean_args = [arg for arg in args if not arg.startswith("-")]
+    is_quiet = any(arg in ("--quiet", "-q", "--service", "-s") for arg in args)
+    if clean_args:
+        ips = _validate_ips(clean_args)
+        if ips is None:
+            return 1
+        return 0 if enable_dns(custom_ips=ips, quiet=is_quiet) else 1
+    return 0 if enable_dns(quiet=is_quiet) else 1
+
+
+def cmd_set_ip(args: Sequence[str]) -> int:
+    if not args:
+        print("Использование: dns-ai set-ip <ip1> [ip2]")
+        return 1
+    ips = _validate_ips(args)
+    if ips is None:
+        return 1
+    return 0 if enable_dns(custom_ips=ips) else 1
+
+
+def cmd_set_sni(args: Sequence[str]) -> int:
+    if not args:
+        print("Использование: dns-ai set-sni <auto|backup|primary|none|<ip>>")
+        return 1
+    mode = _normalize_sni(args[0])
+    if mode is None:
+        error(f"Некорректный режим SNI: {args[0]}")
+        return 1
+    set_sni_mode(mode)
+    print(f"SNI mode set to: {mode}")
+    if mode in ("none", "disabled"):
+        update_hosts_entry("")
+    if is_active():
+        return 0 if enable_dns() else 1
+    return 0
+
+
+def cmd_update() -> int:
+    print("--> Обновление кэша эндпоинтов DNS-AI...")
+    data = download_endpoints()
+    if not data:
+        error("Не удалось загрузить endpoints.json. Проверьте сеть.")
+        return 1
+    cache_endpoints(data)
+    print(f"{C_GREEN}✓ Кэш эндпоинтов обновлён (v4: {', '.join(data.get('v4', []))}).{C_RESET}")
+    if is_active():
+        return 0 if enable_dns(endpoint_data=data) else 1
+    print("✓ Кэш обновлен. Запустите 'dns-ai on' для активации.")
+    return 0
+
+
+def cmd_autostart(args: Sequence[str]) -> int:
+    return manage_autostart(args[0] if args else "status")
+
+# ------------------------------------------------------------------------------
+# Privilege escalation and command routing
+# ------------------------------------------------------------------------------
+
+NO_ROOT_COMMANDS = {"test", "status", "-h", "--help", "help"}
+ROOT_COMMANDS = {
+    "on", "enable", "start",
+    "off", "disable", "stop",
+    "toggle",
+    "reconcile",
+    "autostart",
+    "set-sni",
+    "set-ip",
+    "update", "refresh",
+    "upgrade", "self-update", "update-app",
+    "reset",
+    "tui", "menu", "",
 }
 
-# ----------------- Main TUI Menu Loop -----------------
-main_tui() {
-    trap "clear; exit 0" SIGINT SIGTERM
-    while true; do
-        clear
-        echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_CYAN}║                  DNS-AI Management Console                         ║${C_RESET}"
-        echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
 
-        # Status block
-        if is_active; then
-            echo -e "  Служба DNS-AI:  ${C_GREEN}● РАБОТАЕТ (DoT $TLS_NAME активен)${C_RESET}"
-        else
-            echo -e "  Служба DNS-AI:  ${C_RED}○ ВЫКЛЮЧЕН (используется системный DNS)${C_RESET}"
-        fi
+def needs_root(command: str) -> bool:
+    if command in NO_ROOT_COMMANDS:
+        return False
+    return command in ROOT_COMMANDS
 
-        if is_autostart_enabled; then
-            echo -e "  Автозагрузка:   ${C_GREEN}● ВКЛЮЧЕНА (systemd service enabled)${C_RESET}"
-        else
-            echo -e "  Автозагрузка:   ${C_YELLOW}○ ОТКЛЮЧЕНА${C_RESET}"
-        fi
 
-        local active_sni
-        active_sni=$(get_active_sni_in_hosts)
-        if [ -n "$active_sni" ]; then
-            echo -e "  Google AI SNI:  ${C_WHITE}$active_sni${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
-        else
-            echo -e "  Google AI SNI:  ${C_YELLOW}без оверрайда${C_RESET} \033[0;90m($(get_current_sni_mode_desc))\033[0m"
-        fi
+def escalate() -> int:
+    """Re-exec through sudo/doas when root privileges are required."""
+    if os.environ.get("DNS_AI_NO_ESCALATE") == "1" or os.environ.get("DNS_AI_ESCALATED") == "1":
+        print(f"{C_RED}Ошибка:{C_RESET} Для выполнения этого действия требуются права root (sudo).", file=sys.stderr)
+        return 1
+    tool = shutil.which("sudo") or shutil.which("doas")
+    if not tool:
+        print(f"{C_RED}Ошибка:{C_RESET} Для выполнения этого действия требуются права root (sudo).", file=sys.stderr)
+        return 1
 
-        echo -e "  Резерв DoT:     ${C_GRAY}Два независимых узла DoT (194.87.196.13, 45.151.102.219)${C_RESET}"
-        echo ""
-        echo -e "  ${C_BLUE}0)${C_RESET} ${C_BOLD}Выйти${C_RESET}"
-        echo -e "  ${C_GREEN}1)${C_RESET} $( is_active && echo -e "${C_RED}Выключить DNS-AI${C_RESET}" || echo -e "${C_GREEN}Включить DNS-AI${C_RESET}" )"
-        echo -e "  ${C_CYAN}2)${C_RESET} Полный тест доступности (DoT, SNI, AI сервисы)"
-        echo -e "  ${C_MAGENTA}3)${C_RESET} Управление автозагрузкой (Systemd)"
-        echo -e "  ${C_YELLOW}4)${C_RESET} Настройка Google AI SNI узла"
-        echo -e "  ${C_CYAN}5)${C_RESET} Обновить список адресов (endpoints.json с dns-ai.ru)"
-        echo -e "  ${C_GREEN}6)${C_RESET} Обновить программу из GitHub (Self-update)"
-        echo -e "  ${C_WHITE}7)${C_RESET} Ручной ввод DNS IP"
-        echo -e "  ${C_GRAY}8)${C_RESET} Подробная системная сводка (resolvectl)"
-        echo -e "  ${C_RED}9)${C_RESET} Сбросить все настройки сети до стандартных"
-        echo ""
-        echo -e "  \033[0;90mРепозиторий проекта: https://github.com/Falmer-128/dns-ai-tui\033[0m"
-        echo ""
+    script = os.path.abspath(sys.argv[0])
+    args = sys.argv[1:]
+    env_tool = shutil.which("env")
+    prefix: List[str] = [tool]
+    if env_tool:
+        prefix.extend([env_tool, "DNS_AI_ESCALATED=1"])
+    if os.access(script, os.X_OK):
+        target = [script, *args]
+    else:
+        target = [sys.executable, script, *args]
 
-        read -p "$(echo -e "${C_CYAN}Выберите действие [0-9]: ${C_RESET}")" CHOICE
-        case "$CHOICE" in
-            1)
-                toggle_dns
-                sleep 1.2
-                ;;
-            2)
-                clear
-                run_full_test
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
-                ;;
-            3)
-                menu_autostart
-                ;;
-            4)
-                menu_sni_settings
-                ;;
-            5)
-                echo -e "${C_CYAN}--> Загрузка актуальных адресов с dns-ai.ru...${C_RESET}"
-                if fetch_endpoints >/dev/null; then
-                    echo -e "${C_GREEN}✓ Кэш адресов успешно обновлен!${C_RESET}"
-                    if is_active; then enable_dns; fi
-                else
-                    echo -e "${C_RED}✗ Не удалось загрузить адреса.${C_RESET}"
-                fi
-                sleep 2
-                ;;
-            6)
-                self_update
-                ;;
-            7)
-                menu_custom_dns
-                ;;
-            8)
-                clear
-                show_status
-                echo ""
-                read -p "$(echo -e "${C_CYAN}Нажмите Enter для возврата в меню...${C_RESET}")"
-                ;;
-            9)
-                echo -e "${C_YELLOW}Сброс настроек DNS-AI и восстановление дефолтной сети...${C_RESET}"
-                disable_dns
-                manage_autostart disable 2>/dev/null || true
-                rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
-                echo -e "${C_GREEN}✓ Все настройки сброшены.${C_RESET}"
-                sleep 2
-                ;;
-            0|"q"|"Q")
-                clear
-                exit 0
-                ;;
-            *)
-                echo -e "${C_RED}Неверный ввод! Попробуйте снова.${C_RESET}"
-                sleep 1
-                ;;
-        esac
-    done
-}
+    try:
+        os.execv(tool, prefix + target)
+    except OSError as exc:
+        print(f"{C_RED}Ошибка:{C_RESET} Не удалось повысить права: {short_error(exc)}", file=sys.stderr)
+        return 1
+    return 1
 
-show_help() {
-    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║                  DNS-AI Management Console (CLI)                   ║${C_RESET}"
-    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
-    echo -e "${C_BOLD}Использование:${C_RESET} ${C_CYAN}dns-ai${C_RESET} [КОМАНДА] [ПАРАМЕТРЫ]"
-    echo ""
-    echo -e "Если запустить ${C_CYAN}dns-ai${C_RESET} без аргументов, откроется интерактивное TUI-меню."
-    echo ""
-    echo -e "${C_BOLD}Основные команды:${C_RESET}"
-    echo -e "  ${C_GREEN}on${C_RESET} [IP...]               Включить DNS-over-TLS и маршрутизацию нейросетей"
-    echo -e "                           (опционально можно передать свои IP адреса)"
-    echo -e "  ${C_RED}off${C_RESET}                      Выключить DNS-AI, восстановить системный DNS"
-    echo -e "  ${C_YELLOW}toggle${C_RESET}                   Быстро переключить состояние (Вкл / Выкл)"
-    echo -e "  ${C_CYAN}status${C_RESET}                   Показать текущее состояние DoT, resolved и hosts"
-    echo -e "  ${C_MAGENTA}test${C_RESET}                     Комплексная диагностика (DoT 853, SNI прокси, AI)"
-    echo ""
-    echo -e "${C_BOLD}Автозагрузка и узлы:${C_RESET}"
-    echo -e "  ${C_CYAN}autostart${C_RESET} <действие>     Управление службой автозагрузки systemd:"
-    echo -e "                             ${C_GREEN}enable${C_RESET}   — включить автозагрузку при старте ОС"
-    echo -e "                             ${C_YELLOW}disable${C_RESET}  — выключить автозагрузку"
-    echo -e "                             ${C_CYAN}status${C_RESET}   — проверить текущее состояние"
-    echo -e "                             ${C_MAGENTA}toggle${C_RESET}   — переключить состояние"
-    echo -e "  ${C_CYAN}set-sni${C_RESET} <режим|IP>       Настройка промежуточного узла Google AI:"
-    echo -e "                             ${C_GREEN}auto${C_RESET}     — автоматический выбор с проверкой TLS"
-    echo -e "                             ${C_CYAN}backup${C_RESET}   — резервный узел ($BACKUP_SNI_IP) [стабилен]"
-    echo -e "                             ${C_YELLOW}primary${C_RESET}  — официальный узел ($PRIMARY_SNI_IP)"
-    echo -e "                             ${C_RED}none${C_RESET}     — отключить оверрайд Google AI"
-    echo -e "                             ${C_WHITE}<IP>${C_RESET}     — использовать свой IP адрес"
-    echo -e "  ${C_CYAN}set-ip${C_RESET} <IP1> [IP2]       Указать пользовательские DNS-серверы"
-    echo -e "  ${C_CYAN}update${C_RESET}                   Обновить список серверов (endpoints.json)"
-    echo -e "  ${C_GREEN}upgrade${C_RESET}, ${C_GREEN}self-update${C_RESET}     Обновить саму программу из GitHub"
-    echo -e "  ${C_RED}reset${C_RESET}                    Полный сброс параметров сети до стандартных"
-    echo -e "  ${C_CYAN}tui${C_RESET}, ${C_CYAN}menu${C_RESET}                Принудительный запуск интерактивной консоли"
-    echo -e "  ${C_BLUE}-h${C_RESET}, ${C_BLUE}--help${C_RESET}, ${C_BLUE}help${C_RESET}         Показать эту справку и выйти"
-    echo ""
-    echo -e "${C_BOLD}Примеры:${C_RESET}"
-    echo -e "  ${C_CYAN}dns-ai${C_RESET}                   # Интерактивное TUI-меню"
-    echo -e "  ${C_CYAN}dns-ai on${C_RESET}                # Включение с официальными серверами"
-    echo -e "  ${C_CYAN}dns-ai test${C_RESET}              # Полный тест доступности DoT и прокси"
-    echo -e "  ${C_CYAN}dns-ai upgrade${C_RESET}           # Обновление программы из GitHub"
-    echo -e "  ${C_CYAN}dns-ai set-sni backup${C_RESET}    # Переключение Google AI на резервный узел"
-    echo -e "  ${C_CYAN}dns-ai autostart enable${C_RESET}  # Включение запуска при загрузке системы"
-    echo ""
-}
 
-# ----------------- CLI Command Routing -----------------
-case "$1" in
-    on|enable|start)
-        shift
-        enable_dns "$@"
-        ;;
-    off|disable|stop)
-        disable_dns
-        ;;
-    toggle)
-        shift
-        toggle_dns "$@"
-        ;;
-    update|refresh)
-        echo "--> Обновление кэша эндпоинтов DNS-AI..."
-        fetch_endpoints
-        if is_active; then
-            enable_dns
-        else
-            echo "✓ Кэш обновлен. Запустите 'dns-ai on' для активации."
-        fi
-        ;;
-    upgrade|self-update|update-app)
-        shift
-        self_update "$@"
-        ;;
-    test)
-        run_full_test
-        ;;
-    status)
-        show_status
-        ;;
-    autostart)
-        shift
-        manage_autostart "${1:-status}"
-        ;;
-    set-sni)
-        shift
-        if [ -n "$1" ]; then
-            echo "$1" > "$MODE_FILE"
-            echo "SNI mode set to: $1"
-            if is_active; then enable_dns; fi
-        else
-            echo "Использование: dns-ai set-sni <auto|backup|primary|none|<ip>>"
-        fi
-        ;;
-    set-ip)
-        shift
-        if [ -z "$1" ]; then
-            echo "Использование: dns-ai set-ip <ip1> [ip2]"
-            exit 1
-        fi
-        enable_dns "$*"
-        ;;
-    reset)
-        disable_dns
-        manage_autostart disable 2>/dev/null || true
-        rm -f "$MODE_FILE" "$CACHE_FILE" 2>/dev/null || true
-        echo "✓ Сброс завершен."
-        ;;
-    -h|--help|help)
-        show_help
-        ;;
-    tui|menu|"")
-        main_tui
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
+def main(argv: Sequence[str]) -> int:
+    command = argv[0] if argv else ""
+    args = list(argv[1:])
+
+    if command in ("on", "enable", "start"):
+        return cmd_on(args)
+    if command in ("off", "disable", "stop"):
+        is_quiet = any(a in ("--quiet", "-q", "--service", "-s") for a in args)
+        return 0 if disable_dns(quiet=is_quiet) else 1
+    if command == "toggle":
+        return 0 if toggle_dns() else 1
+    if command == "reconcile":
+        return cmd_reconcile()
+    if command == "status":
+        show_status()
+        return 0
+    if command == "test":
+        run_full_test()
+        return 0
+    if command == "autostart":
+        return cmd_autostart(args)
+    if command == "set-sni":
+        return cmd_set_sni(args)
+    if command == "set-ip":
+        return cmd_set_ip(args)
+    if command in ("update", "refresh"):
+        return cmd_update()
+    if command in ("upgrade", "self-update", "update-app"):
+        return self_update()
+    if command == "reset":
+        return reset_all("✓ Сброс завершен.")
+    if command in ("-h", "--help", "help"):
+        show_help()
+        return 0
+    if command in ("tui", "menu", ""):
+        return main_tui()
+
+    show_help()
+    return 1
+
+
+def entry() -> int:
+    """Top-level guard: escalation, clean interrupts, no tracebacks."""
+    try:
+        argv = list(sys.argv[1:])
+        command = argv[0] if argv else ""
+        if needs_root(command) and os.geteuid() != 0:
+            return escalate()
+        return main(argv)
+    except KeyboardInterrupt:
+        if sys.stdout.isatty():
+            clear_screen()
+        return 130
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        return 0
+    except Exception as exc:  # pragma: no cover - final safety net
+        if os.environ.get("DNS_AI_DEBUG"):
+            raise
+        print(f"{C_RED}✗ Ошибка:{C_RESET} {short_error(exc)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(entry())

@@ -1,14 +1,18 @@
 [Unit]
 Description=DNS-AI Encrypted DNS and AI Services Routing
 Documentation=https://github.com/Falmer-128/dns-ai-tui
-After=network-online.target systemd-resolved.service
-Wants=network-online.target systemd-resolved.service
+After=network-online.target time-sync.target systemd-resolved.service NetworkManager-wait-online.service
+Wants=network-online.target time-sync.target systemd-resolved.service
+ConditionPathExists=/usr/local/bin/dns-ai
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/dns-ai on
-ExecStop=/usr/local/bin/dns-ai off
+ExecStart=/usr/local/bin/dns-ai on --service
+ExecStop=/usr/local/bin/dns-ai off --service
+ExecReload=/usr/local/bin/dns-ai reconcile --quiet
+TimeoutStartSec=30
+SyslogIdentifier=dns-ai
 
 [Install]
 WantedBy=multi-user.target

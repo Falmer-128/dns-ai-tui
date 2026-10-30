@@ -21,91 +21,115 @@ echo -e "${C_CYAN}╚═══════════════════�
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${C_RED}Ошибка:${C_RESET} Для установки требуются права суперпользователя."
     echo -e "Запустите команду через sudo:"
-    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/install.sh | sudo bash${C_RESET}"
+    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/dev/install.sh | sudo bash${C_RESET}"
     echo -e "или:"
     echo -e "  ${C_CYAN}sudo ./install.sh${C_RESET}"
     exit 1
 fi
 
-REPO_RAW="https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main"
+REPO_RAW="https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/dev"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
-# Check and install requirements for Debian, Ubuntu, Fedora, Arch, etc.
+# Check and install requirements with proper distro adaptors
 install_dependencies() {
     echo -e "${C_CYAN}--> Проверка системных зависимостей...${C_RESET}"
 
-    local pkgs=()
-    command -v curl >/dev/null 2>&1 || pkgs+=("curl")
-    command -v python3 >/dev/null 2>&1 || pkgs+=("python3")
-    if ! dpkg -s ca-certificates >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-        pkgs+=("ca-certificates")
-    fi
+    local needed=()
+    command -v curl >/dev/null 2>&1 || needed+=("curl")
+    command -v python3 >/dev/null 2>&1 || needed+=("python3")
 
-    # In Debian 12 / Ubuntu, systemd-resolved is often not installed by default
-    if ! command -v resolvectl >/dev/null 2>&1 && ! systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then
-        pkgs+=("systemd-resolved")
-    fi
+    # Distro-specific package manager resolution
+    if command -v apt-get >/dev/null 2>&1; then
+        if ! dpkg -s ca-certificates >/dev/null 2>&1; then
+            needed+=("ca-certificates")
+        fi
+        if ! command -v resolvectl >/dev/null 2>&1 && ! systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then
+            needed+=("systemd-resolved")
+        fi
 
-    if [ ${#pkgs[@]} -gt 0 ]; then
-        echo -e "${C_YELLOW}--> Обнаружены недостающие пакеты: ${pkgs[*]}${C_RESET}"
-        echo -e "${C_CYAN}--> Автоматическая установка через пакетный менеджер...${C_RESET}"
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -y
-            apt-get install -y "${pkgs[@]}"
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "${pkgs[@]}"
-        elif command -v pacman >/dev/null 2>&1; then
-            pacman -Sy --noconfirm --needed "${pkgs[@]}"
-        elif command -v zypper >/dev/null 2>&1; then
-            zypper --non-interactive install "${pkgs[@]}"
-        elif command -v apk >/dev/null 2>&1; then
-            apk add "${pkgs[@]}"
-        else
-            echo -e "${C_RED}Не удалось определить пакетный менеджер. Установите вручную: ${pkgs[*]}${C_RESET}"
-            exit 1
+        if [ ${#needed[@]} -gt 0 ]; then
+            echo -e "${C_YELLOW}--> Установка недостающих пакетов через apt-get: ${needed[*]}${C_RESET}"
+            DEBIAN_FRONTEND=noninteractive apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${needed[@]}"
+        fi
+
+    elif command -v pacman >/dev/null 2>&1; then
+        local pac_pkgs=()
+        command -v curl >/dev/null 2>&1 || pac_pkgs+=("curl")
+        command -v python3 >/dev/null 2>&1 || pac_pkgs+=("python")
+        if [ ${#pac_pkgs[@]} -gt 0 ]; then
+            echo -e "${C_YELLOW}--> Установка недостающих пакетов через pacman: ${pac_pkgs[*]}${C_RESET}"
+            pacman -S --needed --noconfirm "${pac_pkgs[@]}"
+        fi
+
+    elif command -v dnf >/dev/null 2>&1; then
+        local dnf_pkgs=()
+        command -v curl >/dev/null 2>&1 || dnf_pkgs+=("curl")
+        command -v python3 >/dev/null 2>&1 || dnf_pkgs+=("python3")
+        if ! command -v resolvectl >/dev/null 2>&1; then
+            dnf_pkgs+=("systemd-resolved")
+        fi
+        if [ ${#dnf_pkgs[@]} -gt 0 ]; then
+            echo -e "${C_YELLOW}--> Установка недостающих пакетов через dnf: ${dnf_pkgs[*]}${C_RESET}"
+            dnf install -y "${dnf_pkgs[@]}"
+        fi
+
+    elif command -v zypper >/dev/null 2>&1; then
+        local zyp_pkgs=()
+        command -v curl >/dev/null 2>&1 || zyp_pkgs+=("curl")
+        command -v python3 >/dev/null 2>&1 || zyp_pkgs+=("python3")
+        if [ ${#zyp_pkgs[@]} -gt 0 ]; then
+            echo -e "${C_YELLOW}--> Установка через zypper: ${zyp_pkgs[*]}${C_RESET}"
+            zypper --non-interactive install "${zyp_pkgs[@]}"
         fi
     fi
 
-    # Activate systemd-resolved
+    # Activate systemd-resolved if available
     if systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved.service"; then
         echo -e "${C_CYAN}--> Активация службы systemd-resolved...${C_RESET}"
         systemctl enable --now systemd-resolved 2>/dev/null || true
     fi
 
-    # Configure NetworkManager to cooperate with systemd-resolved (Debian / Ubuntu / Fedora)
+    # Configure NetworkManager to route through systemd-resolved
     if systemctl is-active --quiet NetworkManager 2>/dev/null && [ -d /etc/NetworkManager/conf.d ]; then
         echo -e "${C_CYAN}--> Интеграция NetworkManager с systemd-resolved...${C_RESET}"
-        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/dns-ai-resolved.conf
+        cat << 'NM_CONF' > /etc/NetworkManager/conf.d/90-dns-ai.conf
 [main]
 dns=systemd-resolved
 NM_CONF
-        systemctl reload NetworkManager 2>/dev/null || true
+        # Remove deprecated old config if exists
+        rm -f /etc/NetworkManager/conf.d/dns-ai-resolved.conf 2>/dev/null || true
+        systemctl restart NetworkManager 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
     fi
 
     # Ensure /etc/resolv.conf points to systemd-resolved stub
     if [ -d /run/systemd/resolve ] || [ -f /run/systemd/resolve/stub-resolv.conf ]; then
-        if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf 2>/dev/null)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
+        local current_link
+        current_link=$(readlink /etc/resolv.conf 2>/dev/null || true)
+        if [ "$current_link" != "/run/systemd/resolve/stub-resolv.conf" ] && [ "$current_link" != "../run/systemd/resolve/stub-resolv.conf" ]; then
             echo -e "${C_CYAN}--> Привязка /etc/resolv.conf к stub-resolv.conf...${C_RESET}"
-            [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
-            rm -f /etc/resolv.conf
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+                cp -p /etc/resolv.conf /etc/resolv.conf.dns-ai.bak 2>/dev/null || true
+            fi
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf.tmp.$$
+            mv -Tf /etc/resolv.conf.tmp.$$ /etc/resolv.conf 2>/dev/null || mv -f /etc/resolv.conf.tmp.$$ /etc/resolv.conf
         fi
     fi
 }
 
 install_dependencies
 
-# Determine source of files (local repo or GitHub download)
+# Determine source of files (local directory vs GitHub)
 TMP_SRC=""
 if [ -n "${BASH_SOURCE[0]}" ] && [ -f "$SCRIPT_DIR/dns-ai" ] && [ -f "$SCRIPT_DIR/dns-ai.service" ]; then
     SRC_DIR="$SCRIPT_DIR"
 else
-    echo -e "${C_CYAN}--> Загрузка файлов dns-ai и службы из GitHub...${C_RESET}"
+    echo -e "${C_CYAN}--> Загрузка компонентов dns-ai из GitHub...${C_RESET}"
     TMP_SRC=$(mktemp -d /tmp/dns-ai-install.XXXXXX)
     if ! curl -fsSL --max-time 15 "$REPO_RAW/dns-ai" -o "$TMP_SRC/dns-ai" || \
-       ! curl -fsSL --max-time 15 "$REPO_RAW/dns-ai.service" -o "$TMP_SRC/dns-ai.service"; then
+       ! curl -fsSL --max-time 15 "$REPO_RAW/dns-ai.service" -o "$TMP_SRC/dns-ai.service" || \
+       ! curl -fsSL --max-time 15 "$REPO_RAW/90-dns-ai" -o "$TMP_SRC/90-dns-ai"; then
         echo -e "${C_RED}Ошибка: Не удалось загрузить установочные файлы с GitHub.${C_RESET}"
-        echo -e "${C_YELLOW}Проверьте подключение к интернету или доступность raw.githubusercontent.com.${C_RESET}"
         rm -rf "$TMP_SRC"
         exit 1
     fi
@@ -114,11 +138,9 @@ fi
 
 # Copy binary
 echo -e "${C_CYAN}--> Установка исполняемого файла /usr/local/bin/dns-ai...${C_RESET}"
-mkdir -p /usr/local/bin
+mkdir -p /usr/local/bin /etc/dns-ai /var/lib/dns-ai /run/dns-ai
 cp -f "$SRC_DIR/dns-ai" /usr/local/bin/dns-ai
 chmod 755 /usr/local/bin/dns-ai
-
-# Symlink dns-ai-tui
 ln -sf /usr/local/bin/dns-ai /usr/local/bin/dns-ai-tui
 
 # Install systemd service
@@ -127,6 +149,14 @@ mkdir -p /etc/systemd/system
 cp -f "$SRC_DIR/dns-ai.service" /etc/systemd/system/dns-ai.service
 chmod 644 /etc/systemd/system/dns-ai.service
 systemctl daemon-reload
+
+# Install NetworkManager dispatcher hook if NM exists
+if [ -d /etc/NetworkManager/dispatcher.d ] && [ -f "$SRC_DIR/90-dns-ai" ]; then
+    echo -e "${C_CYAN}--> Установка хука NetworkManager dispatcher...${C_RESET}"
+    cp -f "$SRC_DIR/90-dns-ai" /etc/NetworkManager/dispatcher.d/90-dns-ai
+    chown root:root /etc/NetworkManager/dispatcher.d/90-dns-ai
+    chmod 755 /etc/NetworkManager/dispatcher.d/90-dns-ai
+fi
 
 # Clean up temp source if used
 [ -n "$TMP_SRC" ] && rm -rf "$TMP_SRC"
@@ -151,9 +181,11 @@ ALIASES
 }
 
 REAL_USER="${SUDO_USER:-$USER}"
-USER_HOME=$(eval echo "~$REAL_USER")
-setup_shell_aliases "$USER_HOME/.zshrc"
-setup_shell_aliases "$USER_HOME/.bashrc"
+USER_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
+if [ -n "$USER_HOME" ]; then
+    setup_shell_aliases "$USER_HOME/.zshrc"
+    setup_shell_aliases "$USER_HOME/.bashrc"
+fi
 
 echo ""
 echo -e "${C_GREEN}✓ Установка успешно завершена!${C_RESET}"

@@ -1,0 +1,37 @@
+#!/bin/sh
+# ==============================================================================
+#  DNS-AI NetworkManager Dispatcher Hook
+#  Ensures DoT and link-scope DNS settings stay reconciled on network changes
+#  Location: /etc/NetworkManager/dispatcher.d/90-dns-ai (root:root 0755)
+# ==============================================================================
+
+IFACE="$1"
+ACTION="$2"
+
+# 1. Fast early-exit sentinel: if DNS-AI is not enabled, do nothing.
+if [ ! -f /run/dns-ai/enabled ] && [ ! -f /var/lib/dns-ai/state.json ]; then
+    exit 0
+fi
+
+# 2. Only react to connection up or DHCP changes on real network interfaces
+case "$ACTION" in
+    up|dhcp4-change|dhcp6-change|connectivity-change)
+        # Skip loopback, virtual, and docker interfaces
+        case "$IFACE" in
+            lo|docker*|br-*|veth*|virbr*|"") exit 0 ;;
+        esac
+
+        # Execute reconcile asynchronously via systemd-run so NM is never blocked
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemd-run --no-block --quiet --unit=dns-ai-reconcile-nm \
+                /usr/local/bin/dns-ai reconcile --quiet >/dev/null 2>&1 || true
+        else
+            /usr/local/bin/dns-ai reconcile --quiet >/dev/null 2>&1 &
+        fi
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+exit 0
