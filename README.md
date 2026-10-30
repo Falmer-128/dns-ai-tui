@@ -1,11 +1,11 @@
-# DNS-AI Management Console & TUI 🌐🤖
+# DNS-AI & GeoHide Management Console & TUI 🌐🤖
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux%20(Arch%20%7C%20Debian%20%7C%20Ubuntu%20%7C%20Fedora)-brightgreen.svg)](#)
-[![Bash](https://img.shields.io/badge/Language-Bash%20%2F%20Python3-orange.svg)](#)
+[![Python 3](https://img.shields.io/badge/Language-Python%203%20(stdlib)-blue.svg)](#)
 [![systemd](https://img.shields.io/badge/Service-systemd--resolved-red.svg)](#)
 
-Интерактивная консоль управления (**TUI**) и CLI-утилита для настройки шифрованного **DNS-over-TLS (DoT)** через сервис **DNS-AI**, с автоматическим управлением **SNI-проксированием для зарубежных нейросетей** (Google Gemini, Google Antigravity, ChatGPT, Claude) и встроенной защитой от потери интернета.
+Интерактивная консоль управления (**TUI**) и CLI-утилита для настройки шифрованного **DNS-over-TLS (DoT)** через сервисы **GeoHide** и **DNS-AI**, с раздельным автоматическим **SNI-проксированием для зарубежных нейросетей** (Google Gemini, Google Antigravity, ChatGPT, Claude) и встроенной защитой от потери интернета.
 
 Проект оформлен в минималистичном ретро-стиле с красивыми рамками и цветовой индикацией, по аналогии с [zapret.installer](https://github.com/Snowy-Fluffy/zapret.installer).
 
@@ -15,22 +15,23 @@
 
 ```text
 ╔════════════════════════════════════════════════════════════════════╗
-║                  DNS-AI Management Console                         ║
+║            DNS-AI & GeoHide Management Console (TUI)               ║
 ╚════════════════════════════════════════════════════════════════════╝
-  Служба DNS-AI:  ● РАБОТАЕТ (DoT dns.dns-ai.ru активен)
-  Автозагрузка:   ● ВКЛЮЧЕНА (systemd service enabled)
-  Google AI SNI:  143.20.64.55 (Автоматический выбор (с проверкой TLS))
-  Резерв DoT:     Два независимых узла DoT (dns-ai.ru)
+  Активный профиль: GeoHide EU (Европа — Рекомендуется)
+  Состояние службы: ● РАБОТАЕТ (DoT eu.geohide.ru активен)
+  Автозагрузка:     ● ВКЛЮЧЕНА (systemd service enabled)
+  Google AI SNI:    143.20.64.192 (auto)
+  Защита от утечек: NetworkManager DHCP DNS изолирован, Fallback=1.1.1.1
  
   0) Выйти
-  1) Выключить DNS-AI
-  2) Полный тест доступности (DoT, SNI, AI сервисы)
-  3) Управление автозагрузкой (Systemd)
-  4) Настройка Google AI SNI узла
-  5) Обновить список адресов (endpoints.json)
-  6) Обновить программу из GitHub (Self-update)
-  7) Ручной ввод DNS IP
-  8) Подробная системная сводка (resolvectl)
+  1) Выключить шифрованный DNS
+  2) Сменить профиль (GeoHide EU / US / RU | DNS-AI)
+  3) Полный тест доступности (DoT, SNI, AI сервисы)
+  4) Настройка Google AI / Antigravity SNI узла
+  5) Управление автозагрузкой (Systemd)
+  6) Проверить и применить обновление IP серверов (Check & Sync)
+  7) Обновить программу из GitHub (Self-update)
+  8) Подробная системная сводка (resolvectl status)
   9) Сбросить все настройки сети до стандартных
 
   Репозиторий проекта: https://github.com/Falmer-128/dns-ai-tui
