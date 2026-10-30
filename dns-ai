@@ -129,7 +129,7 @@ OPENAI_DOMAINS: Tuple[str, ...] = (
 HOSTS_BEGIN = "# BEGIN DNS-AI-HOSTS"
 HOSTS_END = "# END DNS-AI-HOSTS"
 
-REPO_BRANCH = os.environ.get("DNS_AI_BRANCH", "dev")
+REPO_BRANCH = os.environ.get("DNS_AI_BRANCH", "main")
 REPO_RAW = f"https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/{REPO_BRANCH}"
 SCRIPT_URL = REPO_RAW + "/dns-ai"
 SERVICE_URL = REPO_RAW + "/dns-ai.service"

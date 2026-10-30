@@ -21,13 +21,13 @@ echo -e "${C_CYAN}╚═══════════════════�
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${C_RED}Ошибка:${C_RESET} Для установки требуются права суперпользователя."
     echo -e "Запустите команду через sudo:"
-    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/dev/install.sh | sudo bash${C_RESET}"
+    echo -e "  ${C_CYAN}curl -fsSL https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main/install.sh | sudo bash${C_RESET}"
     echo -e "или:"
     echo -e "  ${C_CYAN}sudo ./install.sh${C_RESET}"
     exit 1
 fi
 
-REPO_RAW="https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/dev"
+REPO_RAW="https://raw.githubusercontent.com/Falmer-128/dns-ai-tui/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
 # Check and install requirements with proper distro adaptors
